@@ -1,5 +1,5 @@
 """
-Skin Pack Exporter -- Substance Painter Plugin v1.2.0
+Skin Pack Exporter -- Substance Painter Plugin v1.3.0
 Compatible with SP 11.1.2+
 
 INSTALLATION:
