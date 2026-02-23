@@ -1,31 +1,28 @@
 """
-Skin Pack Exporter -- Substance Painter Plugin v1.1.0
+Skin Pack Exporter -- Substance Painter Plugin v1.2.0
 Compatible with SP 11.1.2+
 
 INSTALLATION:
-  Place this file in:
-  %USERPROFILE%/Documents/Adobe/Adobe Substance 3D Painter/python/plugins/skin_pack_exporter.py
+  Copy this file to:
+  %USERPROFILE%/Documents/Adobe/Adobe Substance 3D Painter/python/plugins/
 
-  Then in Substance Painter: Python > Plugins > Skin Pack Exporter
+  Then in Substance Painter:
+  Python > Plugins > Skin Pack Exporter
 
-API NOTE:
-  SP's Python SDK does NOT expose substance_painter.layers.
-  All layer manipulation goes through substance_painter.js.evaluate()
-  which runs code inside SP's JavaScript engine (alg.* namespace).
+  The plugin opens as a floating window you can move anywhere.
+  To reopen it: Python > Plugins > Skin Pack Exporter (click again).
 
-EXPORT TYPES:
-  normal       : Text invert ON,  worn OFF, black worn OFF  | Normal folder
-  worn         : Text invert ON,  worn ON,  black worn ON   | Worn (Plastic) + Worn (Metal)
-  bright       : Text invert OFF, worn OFF, black worn OFF  | Bright folder
-  default      : Text invert ON,  worn OFF, black worn OFF  | Black Parts only
-  default_worn : Text invert ON,  worn ON,  black worn ON   | Black Parts only
+HOW "SELECT Layer" WORKS:
+  1. Click any layer/folder in SP's layer panel to select it.
+  2. Click the matching "Select" button in this plugin.
+  3. The plugin reads which layer SP currently has highlighted.
 
-NAME MAPPING:
-  !Skin Tan (Metal)        -> Tan
-  !Skin Tan Worn (Plastic) -> Tan Worn
-  !Skin Black (Any Mat)    -> Default
-  !Skin Black Worn (Metal) -> Default Worn
-  !Skin Gold (Any Mat)     -> Gold
+LAYER STATE PER EXPORT TYPE:
+  normal       | invert ON,  worn OFF, black worn OFF | Normal folder
+  worn         | invert ON,  worn ON,  black worn ON  | Worn(Plastic) + Worn(Metal) both active
+  bright       | invert OFF, worn OFF, black worn OFF | Bright folder
+  default      | invert ON,  worn OFF, black worn OFF | Black Parts only, Skin Pack hidden
+  default_worn | invert ON,  worn ON,  black worn ON  | Black Parts only, Skin Pack hidden
 """
 
 import os
@@ -35,7 +32,7 @@ import glob
 import traceback
 from typing import Optional, List, Dict, Any
 
-# -- Qt (SP 11 ships PySide2; PySide6 fallback just in case) ------------------
+# -- Qt -----------------------------------------------------------------------
 try:
     from PySide2 import QtWidgets, QtCore, QtGui
     from PySide2.QtCore import Qt
@@ -43,15 +40,13 @@ except ImportError:
     from PySide6 import QtWidgets, QtCore, QtGui   # type: ignore
     from PySide6.QtCore import Qt
 
-# -- Substance Painter Python API ---------------------------------------------
-# NOTE: substance_painter.layers does NOT exist in SP 11.
-# Layer access must go through the JavaScript bridge (substance_painter.js).
+# -- Substance Painter API ----------------------------------------------------
 import substance_painter.ui         as sp_ui
 import substance_painter.project    as sp_project
 import substance_painter.textureset as sp_textureset
 import substance_painter.export     as sp_export
 import substance_painter.logging    as sp_log
-import substance_painter.js         as sp_js   # JS bridge for layer ops
+import substance_painter.js         as sp_js
 
 
 # =============================================================================
@@ -59,17 +54,17 @@ import substance_painter.js         as sp_js   # JS bridge for layer ops
 # =============================================================================
 
 PLUGIN_NAME    = "Skin Pack Exporter"
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 
-DEFAULT_SKIN_PACK_NAME  = "!!Skin Pack (All)"
-DEFAULT_TEXT_LAYER      = "Text"
-DEFAULT_BLACK_PARTS     = "Black Parts"
-DEFAULT_NORMAL_FOLDER   = "Normal"
-DEFAULT_WORN_PLASTIC    = "Worn (Plastic)"
-DEFAULT_WORN_METAL      = "Worn (Metal)"
-DEFAULT_BRIGHT_FOLDER   = "Bright"
-DEFAULT_WORN_PAINT      = "Worn"
-DEFAULT_EXPORT_TEMPLATE = "Base Color"
+DEFAULT_SKIN_PACK  = "!!Skin Pack (All)"
+DEFAULT_TEXT       = "Text"
+DEFAULT_BLACK      = "Black Parts"
+DEFAULT_NORMAL     = "Normal"
+DEFAULT_WORN_PLAS  = "Worn (Plastic)"
+DEFAULT_WORN_MET   = "Worn (Metal)"
+DEFAULT_BRIGHT     = "Bright"
+DEFAULT_WORN_PAINT = "Worn"
+DEFAULT_TEMPLATE   = "Base Color"
 
 _RE_SUFFIX = re.compile(r'\s*\([^)]*\)\s*$')
 
@@ -85,29 +80,73 @@ def _log(msg: str, level: str = "info"):
 
 # =============================================================================
 #  JAVASCRIPT BRIDGE
-#  sp_js.evaluate(code) runs code in SP's built-in JS engine and returns the
-#  result.  We JSON.stringify complex objects on the JS side so Python always
-#  receives plain strings it can json.loads().
+#  All layer access goes through sp_js.evaluate().
+#  We return JSON strings from JS so Python always gets plain data.
+#
+#  SP 11 JS API reference (alg namespace):
+#    alg.texturesets.stack(name)        -> LayerStack
+#    alg.layers.nodes(stack)            -> [LayerNode]
+#    alg.layers.visibility(node)        -> bool
+#    alg.layers.setVisibility(node, b)
+#    alg.layers.effects(node)           -> [EffectNode]
+#    alg.layers.isEffectEnabled(effect) -> bool
+#    alg.layers.setEffectEnabled(e, b)
+#    alg.layers.maskNodes(node)         -> [LayerNode]  (layers inside the mask)
+#    alg.layers.selectedLayers(stack)   -> [LayerNode]
 # =============================================================================
 
 def _js(code: str) -> Any:
-    """Evaluate JS in SP's engine. Returns None and logs on failure."""
+    """Run code in SP's JS engine. Returns None and logs on error."""
     try:
         return sp_js.evaluate(code)
     except Exception as exc:
-        _log(f"JS evaluate error: {exc}\nCode: {code[:300]}", "error")
+        _log(f"JS error: {exc}\n--- code ---\n{code[:400]}", "error")
         return None
 
 
 # ---------------------------------------------------------------------------
-#  JS: get full layer tree as JSON
-#  Returns a list of node dicts: {name, type, visible, children, maskNodes,
-#  effects:[{index,name,enabled}]}
+#  DIAGNOSTIC: run a minimal JS call to verify the bridge is working and
+#  return what API surface is available. Helps debug "layer tree" failures.
+# ---------------------------------------------------------------------------
+_JS_DIAG = """
+(function(tsName) {
+    var result = {
+        algExists:          typeof alg !== "undefined",
+        texsetsExists:      typeof alg !== "undefined" && typeof alg.texturesets !== "undefined",
+        layersExists:       typeof alg !== "undefined" && typeof alg.layers !== "undefined",
+        stackFnExists:      false,
+        stackResult:        null,
+        nodesResult:        null,
+        selectedFnExists:   false,
+        error:              null
+    };
+    try {
+        result.stackFnExists  = typeof alg.texturesets.stack === "function";
+        result.selectedFnExists = typeof alg.layers.selectedLayers === "function";
+        if (result.stackFnExists) {
+            var s = alg.texturesets.stack(tsName);
+            result.stackResult = s ? "ok" : "null";
+            if (s) {
+                var nodes = alg.layers.nodes(s);
+                result.nodesResult = nodes ? ("count:" + nodes.length) : "null";
+            }
+        }
+    } catch(e) { result.error = e.toString(); }
+    return JSON.stringify(result);
+})(TSNAME)
+"""
+
+# ---------------------------------------------------------------------------
+#  GET FULL LAYER TREE
+#  Returns list of {name, type, visible, children, maskNodes, effects}
 # ---------------------------------------------------------------------------
 _JS_GET_TREE = """
 (function(tsName) {
+    if (typeof alg === "undefined" || typeof alg.texturesets === "undefined")
+        return JSON.stringify({error: "alg not available"});
+
     var stack = alg.texturesets.stack(tsName);
-    if (!stack) return JSON.stringify([]);
+    if (!stack) return JSON.stringify({error: "stack_null"});
 
     function getEffects(node) {
         var out = [];
@@ -130,12 +169,12 @@ _JS_GET_TREE = """
             var mask = alg.layers.maskNodes(node) || [];
             for (var i = 0; i < mask.length; i++) {
                 out.push({
-                    name:     mask[i].name || "",
-                    type:     "MaskNode",
-                    visible:  alg.layers.visibility(mask[i]),
-                    children: [],
-                    maskNodes:[],
-                    effects:  []
+                    name:      mask[i].name || "",
+                    type:      "MaskNode",
+                    visible:   alg.layers.visibility(mask[i]),
+                    children:  [],
+                    maskNodes: [],
+                    effects:   []
                 });
             }
         } catch(e) {}
@@ -159,37 +198,32 @@ _JS_GET_TREE = """
         return result;
     }
 
-    return JSON.stringify(walk(stack));
+    return JSON.stringify({ok: true, tree: walk(stack)});
 })(TSNAME)
 """
 
 # ---------------------------------------------------------------------------
-#  JS: lightweight name+type+children tree (for the layer picker dialog)
+#  GET SELECTED LAYER NAME
+#  Returns the name of the first currently-selected layer in SP's layer panel.
 # ---------------------------------------------------------------------------
-_JS_NAME_TREE = """
+_JS_GET_SELECTED = """
 (function(tsName) {
-    var stack = alg.texturesets.stack(tsName);
-    if (!stack) return JSON.stringify([]);
-    function walk(parent) {
-        var nodes = alg.layers.nodes(parent) || [];
-        var out = [];
-        for (var i = 0; i < nodes.length; i++) {
-            var n = nodes[i];
-            out.push({
-                name:     n.name || ("layer_" + i),
-                type:     n.type || "Unknown",
-                children: walk(n)
-            });
-        }
-        return out;
+    if (typeof alg === "undefined") return JSON.stringify({error: "alg_missing"});
+    try {
+        var stack    = alg.texturesets.stack(tsName);
+        if (!stack)  return JSON.stringify({error: "stack_null"});
+        var selected = alg.layers.selectedLayers(stack);
+        if (!selected || selected.length === 0)
+            return JSON.stringify({error: "nothing_selected"});
+        return JSON.stringify({ok: true, name: selected[0].name || ""});
+    } catch(e) {
+        return JSON.stringify({error: e.toString()});
     }
-    return JSON.stringify(walk(stack));
 })(TSNAME)
 """
 
 # ---------------------------------------------------------------------------
-#  JS: snapshot all visibility values into a {path: bool} JSON map
-#  'path' uses "|" as a separator.  Mask children use the sentinel __mask__.
+#  SNAPSHOT visibility for the whole stack ({path: bool})
 # ---------------------------------------------------------------------------
 _JS_SNAPSHOT = """
 (function(tsName) {
@@ -208,9 +242,8 @@ _JS_SNAPSHOT = """
             try {
                 var mask = alg.layers.maskNodes(n) || [];
                 for (var j = 0; j < mask.length; j++) {
-                    var mn  = mask[j];
-                    var mnm = mn.name || ("m" + j);
-                    snap[pth + "|__mask__|" + mnm] = alg.layers.visibility(mn);
+                    var mnm = mask[j].name || ("m" + j);
+                    snap[pth + "|__mask__|" + mnm] = alg.layers.visibility(mask[j]);
                 }
             } catch(e) {}
         }
@@ -222,7 +255,7 @@ _JS_SNAPSHOT = """
 """
 
 # ---------------------------------------------------------------------------
-#  JS: restore visibility from a {path: bool} snapshot
+#  RESTORE visibility from snapshot
 # ---------------------------------------------------------------------------
 _JS_RESTORE = """
 (function(tsName, snapJson) {
@@ -234,9 +267,8 @@ _JS_RESTORE = """
         if (!parts.length) return root;
         var nodes = alg.layers.nodes(root) || [];
         for (var i = 0; i < nodes.length; i++) {
-            if ((nodes[i].name || ("layer_" + i)) === parts[0]) {
+            if ((nodes[i].name || ("layer_" + i)) === parts[0])
                 return nodeByPath(nodes[i], parts.slice(1));
-            }
         }
         return null;
     }
@@ -275,12 +307,13 @@ _JS_RESTORE = """
 """
 
 # ---------------------------------------------------------------------------
-#  JS: scan a layer's effects for the first one containing "invert"
+#  SCAN for Invert filter on a named layer
 # ---------------------------------------------------------------------------
 _JS_SCAN_INVERT = """
 (function(tsName, layerPath) {
     var stack = alg.texturesets.stack(tsName);
     if (!stack) return JSON.stringify({found:false, index:-1, names:[]});
+
     var parts = layerPath.split("|");
     var cur   = stack;
     for (var i = 0; i < parts.length; i++) {
@@ -292,6 +325,7 @@ _JS_SCAN_INVERT = """
         if (!next) return JSON.stringify({found:false, index:-1, names:[]});
         cur = next;
     }
+
     var efx   = [];
     try { efx = alg.layers.effects(cur) || []; } catch(e) {}
     var names = [];
@@ -306,14 +340,13 @@ _JS_SCAN_INVERT = """
 """
 
 # ---------------------------------------------------------------------------
-#  JS: apply the full export state for one task in a single evaluate() call
+#  APPLY EXPORT STATE for one task
 # ---------------------------------------------------------------------------
 _JS_APPLY_STATE = """
 (function(tsName, cfg) {
     var stack = alg.texturesets.stack(tsName);
     if (!stack) return "error:no_stack";
 
-    // Find node by "|"-delimited path from the stack root
     function byPath(root, pathStr) {
         if (!pathStr) return null;
         var parts = pathStr.split("|");
@@ -330,7 +363,8 @@ _JS_APPLY_STATE = """
         return cur;
     }
 
-    // Make one child visible inside a group; hide the rest; hide group if no child
+    // Show one child inside a group, hide all others.
+    // If childName is empty/null, hide the group entirely.
     function isolateChild(groupPath, childName) {
         var group = byPath(stack, groupPath);
         if (!group) return;
@@ -343,17 +377,15 @@ _JS_APPLY_STATE = """
         }
     }
 
-    // Hide a group entirely
     function hideGroup(groupPath) {
         var g = byPath(stack, groupPath);
         if (g) alg.layers.setVisibility(g, false);
     }
 
-    // -- 1. Text fill layer --------------------------------------------------
+    // 1. Text fill layer --------------------------------------------------
     if (cfg.textLayerPath) {
         var textNode = byPath(stack, cfg.textLayerPath);
         if (textNode) {
-            // Toggle invert filter
             if (cfg.invertIdx >= 0) {
                 try {
                     var efx = alg.layers.effects(textNode) || [];
@@ -362,7 +394,6 @@ _JS_APPLY_STATE = """
                     }
                 } catch(e) {}
             }
-            // Toggle worn paint layer inside the black mask
             if (cfg.wornPaintName) {
                 try {
                     var mask = alg.layers.maskNodes(textNode) || [];
@@ -376,7 +407,7 @@ _JS_APPLY_STATE = """
         }
     }
 
-    // -- 2. Black Parts folder -----------------------------------------------
+    // 2. Black Parts folder -----------------------------------------------
     if (cfg.blackPartsPath) {
         var bp = byPath(stack, cfg.blackPartsPath);
         if (bp) {
@@ -393,11 +424,11 @@ _JS_APPLY_STATE = """
         }
     }
 
-    // -- 3. Skin Pack folder -------------------------------------------------
+    // 3. Skin Pack folder -------------------------------------------------
     if (cfg.skinPackPath) {
         var sp = byPath(stack, cfg.skinPackPath);
         if (sp) {
-            // Hide entire skin pack for default/default_worn (Black Parts carries those)
+            // default/default_worn: hide the entire skin pack
             alg.layers.setVisibility(sp, !cfg.isDefault);
 
             if (!cfg.isDefault) {
@@ -412,9 +443,8 @@ _JS_APPLY_STATE = """
                     hideGroup(wMetPath);
                     hideGroup(brightPath);
                 } else if (cfg.type === "worn") {
-                    // Normal folder hidden entirely for worn exports
+                    // Normal hidden entirely; both worn folders active simultaneously
                     hideGroup(normPath);
-                    // Both worn folders active at once (one child each)
                     isolateChild(wPlasPath, cfg.wornPlasticSkin);
                     isolateChild(wMetPath,  cfg.wornMetalSkin);
                     hideGroup(brightPath);
@@ -434,35 +464,48 @@ _JS_APPLY_STATE = """
 
 
 # =============================================================================
-#  PYTHON-SIDE HELPERS that wrap the JS calls
+#  PYTHON HELPERS
 # =============================================================================
 
-def _build_js(template: str, replacements: Dict[str, str]) -> str:
+def _build_js(template: str, subs: Dict[str, str]) -> str:
     code = template
-    for key, val in replacements.items():
-        code = code.replace(key, val)
+    for k, v in subs.items():
+        code = code.replace(k, v)
     return code
 
 
-def _get_layer_tree(ts_name: str) -> List[Dict]:
-    raw = _js(_build_js(_JS_GET_TREE, {"TSNAME": json.dumps(ts_name)}))
+def _jparse(raw: Any) -> Optional[Dict]:
+    """Parse a JS result that may be a str or already a dict."""
     if raw is None:
-        return []
-    try:
-        return json.loads(raw) if isinstance(raw, str) else raw
-    except Exception as exc:
-        _log(f"Layer tree parse failed: {exc}", "error")
-        return []
-
-
-def _get_name_tree(ts_name: str) -> List[Dict]:
-    raw = _js(_build_js(_JS_NAME_TREE, {"TSNAME": json.dumps(ts_name)}))
-    if raw is None:
-        return []
+        return None
     try:
         return json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
-        return []
+        return None
+
+
+def _run_diag(ts_name: str) -> Dict:
+    raw = _js(_build_js(_JS_DIAG, {"TSNAME": json.dumps(ts_name)}))
+    return _jparse(raw) or {"error": "evaluate returned None"}
+
+
+def _get_layer_tree(ts_name: str) -> Optional[List[Dict]]:
+    raw  = _js(_build_js(_JS_GET_TREE, {"TSNAME": json.dumps(ts_name)}))
+    data = _jparse(raw)
+    if data is None:
+        return None
+    if "error" in data:
+        _log(f"get_layer_tree JS error: {data['error']}", "error")
+        return None
+    return data.get("tree", [])
+
+
+def _get_selected_layer(ts_name: str) -> Optional[str]:
+    raw  = _js(_build_js(_JS_GET_SELECTED, {"TSNAME": json.dumps(ts_name)}))
+    data = _jparse(raw)
+    if data is None or "error" in data:
+        return None
+    return data.get("name")
 
 
 def _snapshot_visibility(ts_name: str) -> str:
@@ -472,24 +515,16 @@ def _snapshot_visibility(ts_name: str) -> str:
     return raw if isinstance(raw, str) else json.dumps(raw)
 
 
-def _restore_visibility(ts_name: str, snap_json: str):
-    _js(_build_js(_JS_RESTORE, {
-        "TSNAME": json.dumps(ts_name),
-        "SNAP":   snap_json,
-    }))
+def _restore_visibility(ts_name: str, snap: str):
+    _js(_build_js(_JS_RESTORE, {"TSNAME": json.dumps(ts_name), "SNAP": snap}))
 
 
 def _scan_for_invert(ts_name: str, layer_path: str) -> Dict:
-    raw = _js(_build_js(_JS_SCAN_INVERT, {
+    raw  = _js(_build_js(_JS_SCAN_INVERT, {
         "TSNAME":    json.dumps(ts_name),
         "LAYERPATH": json.dumps(layer_path),
     }))
-    if raw is None:
-        return {"found": False, "index": -1, "names": []}
-    try:
-        return json.loads(raw) if isinstance(raw, str) else raw
-    except Exception:
-        return {"found": False, "index": -1, "names": []}
+    return _jparse(raw) or {"found": False, "index": -1, "names": []}
 
 
 def _apply_export_state(ts_name: str, cfg: Dict):
@@ -510,11 +545,9 @@ def clean_skin_name(raw: str) -> str:
     if name.startswith("!Skin "):
         name = name[6:]
     name = _RE_SUFFIX.sub("", name).strip()
-    lower = name.lower()
-    if lower == "black":
-        return "Default"
-    if lower == "black worn":
-        return "Default Worn"
+    low  = name.lower()
+    if low == "black":      return "Default"
+    if low == "black worn": return "Default Worn"
     return name
 
 
@@ -529,101 +562,31 @@ def _find_node(tree: List[Dict], name: str) -> Optional[Dict]:
 
 
 def _find_child(nodes: List[Dict], name: str) -> Optional[Dict]:
-    for n in nodes:
-        if n["name"] == name:
-            return n
-    return None
+    return next((n for n in nodes if n["name"] == name), None)
 
 
 # =============================================================================
-#  LAYER PICKER DIALOG
+#  MAIN DIALOG  (floating window)
 # =============================================================================
 
-class LayerPickerDialog(QtWidgets.QDialog):
-
-    def __init__(self, ts_name: str, parent=None, title: str = "Select a Layer"):
-        super().__init__(parent)
-        self.setWindowTitle(title)
-        self.resize(340, 520)
-        self._ts_name        = ts_name
-        self._selected_name: Optional[str] = None
-
-        layout = QtWidgets.QVBoxLayout(self)
-
-        self._search = QtWidgets.QLineEdit()
-        self._search.setPlaceholderText("Filter layers...")
-        self._search.textChanged.connect(self._filter_tree)
-        layout.addWidget(self._search)
-
-        self._tree = QtWidgets.QTreeWidget()
-        self._tree.setHeaderHidden(True)
-        self._tree.itemDoubleClicked.connect(self._accept)
-        layout.addWidget(self._tree)
-
-        btn_row    = QtWidgets.QHBoxLayout()
-        ok_btn     = QtWidgets.QPushButton("Select")
-        ok_btn.setDefault(True)
-        ok_btn.clicked.connect(self._accept)
-        cancel_btn = QtWidgets.QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_row.addWidget(ok_btn)
-        btn_row.addWidget(cancel_btn)
-        layout.addLayout(btn_row)
-
-        self._populate()
-
-    def _populate(self):
-        self._tree.clear()
-        for node in _get_name_tree(self._ts_name):
-            self._add_item(node, self._tree.invisibleRootItem())
-        self._tree.expandAll()
-
-    def _add_item(self, node: Dict, parent_item):
-        name = node["name"]
-        item = QtWidgets.QTreeWidgetItem(parent_item, [name])
-        item.setData(0, Qt.UserRole, name)
-        is_group = bool(node.get("children")) or "group" in node.get("type", "").lower()
-        if is_group:
-            item.setForeground(0, QtGui.QColor("#e8a84e"))
-            item.setFont(0, QtGui.QFont("", -1, QtGui.QFont.Bold))
-        for child in node.get("children", []):
-            self._add_item(child, item)
-
-    def _filter_tree(self, text: str):
-        text = text.lower()
-
-        def _any_match(item) -> bool:
-            if text in item.text(0).lower():
-                return True
-            return any(_any_match(item.child(i)) for i in range(item.childCount()))
-
-        def _apply(item):
-            item.setHidden(not _any_match(item))
-            for i in range(item.childCount()):
-                _apply(item.child(i))
-
-        for i in range(self._tree.invisibleRootItem().childCount()):
-            _apply(self._tree.invisibleRootItem().child(i))
-
-    def _accept(self):
-        item = self._tree.currentItem()
-        if item:
-            self._selected_name = item.data(0, Qt.UserRole)
-            self.accept()
-
-    def selected_name(self) -> Optional[str]:
-        return self._selected_name
-
-
-# =============================================================================
-#  MAIN EXPORTER WIDGET
-# =============================================================================
-
-class SkinExporterWidget(QtWidgets.QWidget):
+class SkinExporterDialog(QtWidgets.QDialog):
+    """
+    Floating, non-modal window.
+    Stays on top of SP but doesn't block interaction with SP itself.
+    Can be re-opened from Python > Plugins > Skin Pack Exporter.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(PLUGIN_NAME)
+        self.setWindowTitle(f"{PLUGIN_NAME}  v{PLUGIN_VERSION}")
+        # Stay on top but remain non-modal so SP stays interactive
+        self.setWindowFlags(
+            Qt.Window |
+            Qt.WindowStaysOnTopHint |
+            Qt.WindowCloseButtonHint |
+            Qt.WindowMinimizeButtonHint
+        )
+        self.resize(420, 780)
         self._build_ui()
 
     # -------------------------------------------------------------------------
@@ -633,21 +596,14 @@ class SkinExporterWidget(QtWidgets.QWidget):
     def _build_ui(self):
         root = QtWidgets.QVBoxLayout(self)
         root.setSpacing(6)
-        root.setContentsMargins(8, 8, 8, 8)
-
-        title_lbl = QtWidgets.QLabel(
-            f'<b style="font-size:13px">{PLUGIN_NAME}</b>'
-            f'<span style="color:#777; font-size:10px">  v{PLUGIN_VERSION}</span>'
-        )
-        root.addWidget(title_lbl)
-        root.addWidget(self._hline())
+        root.setContentsMargins(10, 10, 10, 10)
 
         # -- Texture Set -------------------------------------------------------
         ts_group = QtWidgets.QGroupBox("Texture Set")
         ts_lay   = QtWidgets.QHBoxLayout(ts_group)
         self._ts_combo = QtWidgets.QComboBox()
         ts_ref = QtWidgets.QPushButton("Refresh")
-        ts_ref.setFixedWidth(56)
+        ts_ref.setFixedWidth(60)
         ts_ref.clicked.connect(self._refresh_ts)
         ts_lay.addWidget(self._ts_combo, 1)
         ts_lay.addWidget(ts_ref)
@@ -657,18 +613,27 @@ class SkinExporterWidget(QtWidgets.QWidget):
         la_group = QtWidgets.QGroupBox("Layer Assignments")
         la_form  = QtWidgets.QFormLayout(la_group)
         la_form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
-        self._skin_pack_edit   = self._picker_row(la_form, "Skin Pack Folder:",   DEFAULT_SKIN_PACK_NAME)
-        self._text_layer_edit  = self._picker_row(la_form, "Text Fill Layer:",    DEFAULT_TEXT_LAYER)
-        self._black_parts_edit = self._picker_row(la_form, "Black Parts Folder:", DEFAULT_BLACK_PARTS)
+
+        # Helper note
+        note = QtWidgets.QLabel(
+            "Click a layer in SP's Layers panel, then press the\n"
+            "matching Select button to capture its name."
+        )
+        note.setStyleSheet("color: #aaa; font-size: 10px;")
+        la_form.addRow(note)
+
+        self._skin_pack_edit   = self._select_row(la_form, "Skin Pack Folder:",   DEFAULT_SKIN_PACK)
+        self._text_layer_edit  = self._select_row(la_form, "Text Fill Layer:",    DEFAULT_TEXT)
+        self._black_parts_edit = self._select_row(la_form, "Black Parts Folder:", DEFAULT_BLACK)
         root.addWidget(la_group)
 
         # -- Sub-folder Names --------------------------------------------------
         sf_group = QtWidgets.QGroupBox("Skin Pack Sub-folder Names")
         sf_form  = QtWidgets.QFormLayout(sf_group)
-        self._normal_edit    = self._text_row(sf_form, "Normal:",         DEFAULT_NORMAL_FOLDER)
-        self._worn_plas_edit = self._text_row(sf_form, "Worn (Plastic):", DEFAULT_WORN_PLASTIC)
-        self._worn_met_edit  = self._text_row(sf_form, "Worn (Metal):",   DEFAULT_WORN_METAL)
-        self._bright_edit    = self._text_row(sf_form, "Bright:",         DEFAULT_BRIGHT_FOLDER)
+        self._normal_edit    = self._text_row(sf_form, "Normal:",         DEFAULT_NORMAL)
+        self._worn_plas_edit = self._text_row(sf_form, "Worn (Plastic):", DEFAULT_WORN_PLAS)
+        self._worn_met_edit  = self._text_row(sf_form, "Worn (Metal):",   DEFAULT_WORN_MET)
+        self._bright_edit    = self._text_row(sf_form, "Bright:",         DEFAULT_BRIGHT)
         root.addWidget(sf_group)
 
         # -- Text Layer Settings -----------------------------------------------
@@ -681,13 +646,11 @@ class SkinExporterWidget(QtWidgets.QWidget):
         self._invert_idx.setValue(-1)
         self._invert_idx.setSpecialValueText("\u26a0 Not set")
         self._invert_idx.setToolTip(
-            "0-based index of the Invert filter in the Text layer's effect list.\n"
-            "Use Scan to auto-detect, or type the index manually.\n"
-            "-1 = filter will not be toggled during export."
+            "0-based index of the Invert filter on the Text fill layer.\n"
+            "Press Scan to auto-detect. -1 means it will not be toggled."
         )
         scan_btn = QtWidgets.QPushButton("Scan")
-        scan_btn.setFixedWidth(48)
-        scan_btn.setToolTip("Scan the Text layer's effects and detect the Invert filter.")
+        scan_btn.setFixedWidth(50)
         scan_btn.clicked.connect(self._scan_invert)
         invert_row.addWidget(self._invert_idx, 1)
         invert_row.addWidget(scan_btn)
@@ -696,9 +659,9 @@ class SkinExporterWidget(QtWidgets.QWidget):
         self._worn_paint_edit = QtWidgets.QLineEdit(DEFAULT_WORN_PAINT)
         self._worn_paint_edit.setToolTip(
             "Name of the paint layer inside the Text layer's black mask.\n"
-            "Turned ON for Worn and Default Worn exports."
+            "Turned ON for 'worn' and 'default_worn' exports."
         )
-        tl_form.addRow("Worn Paint Layer Name:", self._worn_paint_edit)
+        tl_form.addRow("Worn Paint Name:", self._worn_paint_edit)
         root.addWidget(tl_group)
 
         # -- Export Settings ---------------------------------------------------
@@ -709,14 +672,14 @@ class SkinExporterWidget(QtWidgets.QWidget):
         self._folder_edit = QtWidgets.QLineEdit()
         self._folder_edit.setPlaceholderText("Choose export folder...")
         browse_btn = QtWidgets.QPushButton("Browse...")
-        browse_btn.setFixedWidth(62)
+        browse_btn.setFixedWidth(65)
         browse_btn.clicked.connect(self._browse_folder)
         folder_row.addWidget(self._folder_edit, 1)
         folder_row.addWidget(browse_btn)
         ex_form.addRow("Export Folder:", folder_row)
 
-        self._template_edit = QtWidgets.QLineEdit(DEFAULT_EXPORT_TEMPLATE)
-        self._template_edit.setToolTip("Name of your custom export preset (e.g. 'Base Color').")
+        self._template_edit = QtWidgets.QLineEdit(DEFAULT_TEMPLATE)
+        self._template_edit.setToolTip("Name of your SP export preset (e.g. 'Base Color').")
         ex_form.addRow("Output Preset:", self._template_edit)
 
         self._fmt_combo = QtWidgets.QComboBox()
@@ -727,17 +690,29 @@ class SkinExporterWidget(QtWidgets.QWidget):
         self._restore_check.setChecked(True)
         ex_form.addRow("", self._restore_check)
         root.addWidget(ex_group)
+
         root.addWidget(self._hline())
 
-        # -- Buttons -----------------------------------------------------------
+        # -- Diagnose button (helps debug JS issues) ---------------------------
+        diag_row = QtWidgets.QHBoxLayout()
+        diag_btn = QtWidgets.QPushButton("Diagnose JS Bridge")
+        diag_btn.setToolTip(
+            "Runs a quick JS check and prints what alg.* APIs are visible.\n"
+            "Use this if the layer tree fails to load."
+        )
+        diag_btn.clicked.connect(self._run_diag)
+        diag_row.addWidget(diag_btn)
+        root.addLayout(diag_row)
+
+        # -- Action buttons ----------------------------------------------------
         btn_row = QtWidgets.QHBoxLayout()
         self._preview_btn = QtWidgets.QPushButton("Preview")
         self._preview_btn.clicked.connect(self._preview)
         self._export_btn  = QtWidgets.QPushButton("Export All")
         self._export_btn.setStyleSheet(
             "QPushButton { background:#1e6b1e; color:white;"
-            " font-weight:bold; padding:5px; }"
-            "QPushButton:disabled { background:#444; color:#888; }"
+            " font-weight:bold; padding:6px; }"
+            "QPushButton:disabled { background:#3a3a3a; color:#666; }"
         )
         self._export_btn.clicked.connect(self._run_export)
         btn_row.addWidget(self._preview_btn, 1)
@@ -745,46 +720,62 @@ class SkinExporterWidget(QtWidgets.QWidget):
         root.addLayout(btn_row)
 
         # -- Log ---------------------------------------------------------------
-        log_group = QtWidgets.QGroupBox("Export Log")
+        log_group = QtWidgets.QGroupBox("Log")
         log_lay   = QtWidgets.QVBoxLayout(log_group)
         self._log_view = QtWidgets.QPlainTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setMinimumHeight(120)
+        self._log_view.setMinimumHeight(140)
         self._log_view.setFont(QtGui.QFont("Courier New", 8))
         log_lay.addWidget(self._log_view)
-        clear_btn = QtWidgets.QPushButton("Clear Log")
-        clear_btn.setFixedWidth(72)
+        clear_btn = QtWidgets.QPushButton("Clear")
+        clear_btn.setFixedWidth(55)
         clear_btn.clicked.connect(self._log_view.clear)
         log_lay.addWidget(clear_btn, alignment=Qt.AlignRight)
         root.addWidget(log_group)
 
         self._refresh_ts()
 
-    # -- UI helpers -----------------------------------------------------------
+    # -------------------------------------------------------------------------
+    #  UI HELPERS
+    # -------------------------------------------------------------------------
 
-    def _picker_row(self, form, label, default):
+    def _select_row(self, form, label: str, default: str) -> QtWidgets.QLineEdit:
+        """
+        A row with a text field and a "Select" button.
+        Clicking Select grabs the currently-highlighted layer name from SP.
+        """
         row  = QtWidgets.QHBoxLayout()
         edit = QtWidgets.QLineEdit(default)
-        btn  = QtWidgets.QPushButton("Browse...")
-        btn.setFixedWidth(62)
-        btn.clicked.connect(lambda _, e=edit: self._pick_layer(e))
+        btn  = QtWidgets.QPushButton("Select")
+        btn.setFixedWidth(55)
+        btn.setToolTip(
+            "Click a layer in SP's layer panel first,\n"
+            "then press this button to capture its name."
+        )
+        # Use a default-argument capture to avoid the late-binding closure trap.
+        # clicked(checked: bool) -- we accept it with checked=False default.
+        def _on_click(checked=False, _edit=edit):
+            self._grab_selected_layer(_edit)
+        btn.clicked.connect(_on_click)
         row.addWidget(edit, 1)
         row.addWidget(btn)
         form.addRow(label, row)
         return edit
 
-    def _text_row(self, form, label, default):
+    def _text_row(self, form, label: str, default: str) -> QtWidgets.QLineEdit:
         edit = QtWidgets.QLineEdit(default)
         form.addRow(label, edit)
         return edit
 
-    def _hline(self):
+    def _hline(self) -> QtWidgets.QFrame:
         line = QtWidgets.QFrame()
         line.setFrameShape(QtWidgets.QFrame.HLine)
         line.setFrameShadow(QtWidgets.QFrame.Sunken)
         return line
 
-    # -- UI actions -----------------------------------------------------------
+    # -------------------------------------------------------------------------
+    #  UI ACTIONS
+    # -------------------------------------------------------------------------
 
     def _refresh_ts(self):
         self._ts_combo.clear()
@@ -801,15 +792,23 @@ class SkinExporterWidget(QtWidgets.QWidget):
         if folder:
             self._folder_edit.setText(folder)
 
-    def _pick_layer(self, target_edit: QtWidgets.QLineEdit):
+    def _grab_selected_layer(self, target_edit: QtWidgets.QLineEdit):
+        """Read the currently-selected layer from SP and put its name in target_edit."""
         ts = self._ts_name()
         if not ts:
-            QtWidgets.QMessageBox.warning(self, "No Texture Set",
-                "Select a texture set first.")
+            self._ulog("No texture set selected. Refresh and pick one first.")
             return
-        dlg = LayerPickerDialog(ts, parent=self, title="Select Layer / Folder")
-        if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.selected_name():
-            target_edit.setText(dlg.selected_name())
+        name = _get_selected_layer(ts)
+        if name is None:
+            self._ulog(
+                "Could not get selected layer. Make sure:\n"
+                "  1. A project is open\n"
+                "  2. You have clicked a layer in SP's Layers panel\n"
+                "  3. The JS bridge is working (press Diagnose to check)"
+            )
+            return
+        target_edit.setText(name)
+        self._ulog(f"Captured: '{name}'")
 
     def _scan_invert(self):
         ts = self._ts_name()
@@ -817,18 +816,31 @@ class SkinExporterWidget(QtWidgets.QWidget):
             return
         text_name = self._text_layer_edit.text().strip()
         if not text_name:
-            self._ulog("Fill in the Text Layer name before scanning.")
+            self._ulog("Fill in the Text Fill Layer name first, then Scan.")
             return
         result = _scan_for_invert(ts, text_name)
-        if result["found"]:
+        if result.get("found"):
             self._invert_idx.setValue(result["index"])
             self._ulog(f"Invert filter found at index {result['index']} on '{text_name}'.")
         else:
+            names = result.get("names", [])
             self._ulog(
                 f"No 'Invert' effect found on '{text_name}'.\n"
-                f"Effects present: {result['names'] or '(none)'}\n"
-                f"Set the index manually if the effect has a different name."
+                f"Effects found: {names if names else '(none)'}\n"
+                f"Set the index manually if it has a different name."
             )
+
+    def _run_diag(self):
+        """Run the JS diagnostic and dump results to the log."""
+        ts = self._ts_name()
+        self._ulog("--- JS Bridge Diagnostic ---")
+        if not ts:
+            self._ulog("No texture set selected.")
+            return
+        result = _run_diag(ts)
+        for k, v in result.items():
+            self._ulog(f"  {k}: {v}")
+        self._ulog("----------------------------")
 
     # -------------------------------------------------------------------------
 
@@ -842,7 +854,7 @@ class SkinExporterWidget(QtWidgets.QWidget):
         QtWidgets.QApplication.processEvents()
 
     # -------------------------------------------------------------------------
-    #  EXPORT PLAN BUILDER
+    #  EXPORT PLAN
     # -------------------------------------------------------------------------
 
     def _build_plan(self):
@@ -851,8 +863,18 @@ class SkinExporterWidget(QtWidgets.QWidget):
             return None, "No texture set selected."
 
         tree = _get_layer_tree(ts)
-        if not tree:
-            return None, "Could not retrieve layer tree. Is a project open?"
+        if tree is None:
+            # Provide the diagnostic output automatically
+            diag = _run_diag(ts)
+            diag_str = ", ".join(f"{k}={v}" for k, v in diag.items())
+            return None, (
+                f"Could not retrieve layer tree from SP.\n\n"
+                f"JS diagnostic:\n  {diag_str}\n\n"
+                f"Common causes:\n"
+                f"  - Project not fully loaded yet\n"
+                f"  - SP version mismatch (this plugin targets SP 11.1.2)\n"
+                f"  - Press 'Diagnose JS Bridge' for more detail"
+            )
 
         sp_name     = self._skin_pack_edit.text().strip()
         bp_name     = self._black_parts_edit.text().strip()
@@ -863,9 +885,12 @@ class SkinExporterWidget(QtWidgets.QWidget):
 
         skin_pack = _find_node(tree, sp_name)
         if skin_pack is None:
-            return None, f"Skin Pack folder '{sp_name}' not found."
+            return None, (
+                f"Skin Pack folder '{sp_name}' not found.\n"
+                f"Use the Select button next to 'Skin Pack Folder' to pick it."
+            )
 
-        sp_kids = skin_pack.get("children", [])
+        sp_kids          = skin_pack.get("children", [])
         normal_folder    = _find_child(sp_kids, norm_name)
         worn_plas_folder = _find_child(sp_kids, wp_name)
         worn_met_folder  = _find_child(sp_kids, wm_name)
@@ -887,7 +912,7 @@ class SkinExporterWidget(QtWidgets.QWidget):
                     "wornMetalSkin":  None,
                 })
 
-        # Worn (pair by clean name)
+        # Worn — pair Plastic + Metal by clean name
         if worn_plas_folder or worn_met_folder:
             plas_map: Dict[str, str] = {}
             met_map:  Dict[str, str] = {}
@@ -920,7 +945,7 @@ class SkinExporterWidget(QtWidgets.QWidget):
                 })
 
         # Black Parts
-        black_parts = _find_node(tree, bp_name)
+        black_parts = _find_node(tree, bp_name) if bp_name else None
         if black_parts:
             black_name = None
             bworn_name = None
@@ -929,11 +954,17 @@ class SkinExporterWidget(QtWidgets.QWidget):
                 if cn == "Default"      and black_name is None: black_name = child["name"]
                 if cn == "Default Worn" and bworn_name is None: bworn_name = child["name"]
             if black_name:
-                tasks.append({"filename": "Default",      "type": "default",
-                               "activeSkin": None, "wornPlasticSkin": None, "wornMetalSkin": None})
+                tasks.append({"filename": "Default",
+                               "type": "default",
+                               "activeSkin": None,
+                               "wornPlasticSkin": None,
+                               "wornMetalSkin": None})
             if bworn_name:
-                tasks.append({"filename": "Default Worn", "type": "default_worn",
-                               "activeSkin": None, "wornPlasticSkin": None, "wornMetalSkin": None})
+                tasks.append({"filename": "Default Worn",
+                               "type": "default_worn",
+                               "activeSkin": None,
+                               "wornPlasticSkin": None,
+                               "wornMetalSkin": None})
 
         return tasks, None
 
@@ -965,33 +996,35 @@ class SkinExporterWidget(QtWidgets.QWidget):
             )
 
     # -------------------------------------------------------------------------
-    #  MAIN EXPORT RUNNER
+    #  EXPORT RUNNER
     # -------------------------------------------------------------------------
 
     def _run_export(self):
         if not sp_project.is_open():
-            QtWidgets.QMessageBox.warning(self, "No Project", "No project is currently open.")
+            QtWidgets.QMessageBox.warning(self, "No Project", "No project is open.")
             return
         export_dir = self._folder_edit.text().strip()
         if not export_dir:
-            QtWidgets.QMessageBox.warning(self, "No Folder", "Please select an export folder.")
+            QtWidgets.QMessageBox.warning(self, "No Folder", "Please pick an export folder.")
             return
 
-        # Pre-export warnings
+        # Pre-flight warnings
         warns = []
         if self._invert_idx.value() < 0:
             warns.append(
-                "Invert Filter Index is not set -- the Invert filter will NOT be toggled "
-                "(Bright vs Normal/Worn distinction will be missing). Use Scan to fix this."
+                "Invert Filter Index is not set -- the filter will NOT be toggled.\n"
+                "  Bright skins will have the same invert state as Normal skins.\n"
+                "  Press Scan next to the Invert Filter Index to fix this."
             )
         if not self._text_layer_edit.text().strip():
-            warns.append("Text Fill Layer name is empty -- text effects will be skipped.")
+            warns.append("Text Fill Layer is empty -- text effects will be skipped.")
         if not self._black_parts_edit.text().strip():
-            warns.append("Black Parts Folder name is empty -- Default/Default Worn will be skipped.")
+            warns.append("Black Parts Folder is empty -- Default/Default Worn skipped.")
         if warns:
             msg   = "\n\n".join(f"  * {w}" for w in warns)
             reply = QtWidgets.QMessageBox.warning(
-                self, "Export Warnings", f"Proceed anyway?\n\n{msg}",
+                self, "Export Warnings",
+                f"Proceed anyway?\n\n{msg}",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
             )
             if reply != QtWidgets.QMessageBox.Yes:
@@ -1003,7 +1036,7 @@ class SkinExporterWidget(QtWidgets.QWidget):
             return
         if not tasks:
             QtWidgets.QMessageBox.information(self, "Nothing to Export",
-                "No exportable skins found.")
+                "No exportable skins were found.")
             return
 
         os.makedirs(export_dir, exist_ok=True)
@@ -1017,9 +1050,9 @@ class SkinExporterWidget(QtWidgets.QWidget):
         invert_idx = self._invert_idx.value()
         worn_paint = self._worn_paint_edit.text().strip()
 
-        # Resolve Black Parts children names for the JS cfg
+        # Resolve Black Parts child names once
         tree        = _get_layer_tree(ts_name)
-        black_parts = _find_node(tree, bp_name)
+        black_parts = _find_node(tree, bp_name) if (tree and bp_name) else None
         black_name  = None
         bworn_name  = None
         if black_parts:
@@ -1040,9 +1073,7 @@ class SkinExporterWidget(QtWidgets.QWidget):
 
         ok_count = fail_count = 0
 
-        progress = QtWidgets.QProgressDialog(
-            "Exporting...", "Cancel", 0, len(tasks), self
-        )
+        progress = QtWidgets.QProgressDialog("Exporting...", "Cancel", 0, len(tasks), self)
         progress.setWindowTitle(PLUGIN_NAME)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
@@ -1086,14 +1117,15 @@ class SkinExporterWidget(QtWidgets.QWidget):
                 }
 
                 _apply_export_state(ts_name, cfg)
-                exported = self._do_export(ts_name, template, file_fmt,
-                                           export_dir, task["filename"])
+                exported = self._do_export(
+                    ts_name, template, file_fmt, export_dir, task["filename"]
+                )
                 if exported:
                     ok_count += 1
                     self._ulog("  OK")
                 else:
                     fail_count += 1
-                    self._ulog("  Export returned no result -- check SP's log panel.")
+                    self._ulog("  Export returned no result -- check SP's log.")
 
             except Exception:
                 fail_count += 1
@@ -1134,7 +1166,7 @@ class SkinExporterWidget(QtWidgets.QWidget):
 
         result = sp_export.export_project_textures(config)
 
-        # Auto-rename if SP appended the preset name (e.g. "Tan_Base Color.png")
+        # Auto-rename if SP appended preset name (e.g. "Tan_Base Color.png")
         expected = os.path.join(export_dir, f"{filename}.{file_fmt}")
         if not os.path.exists(expected):
             for pattern in (
@@ -1154,27 +1186,41 @@ class SkinExporterWidget(QtWidgets.QWidget):
 #  PLUGIN ENTRY POINTS
 # =============================================================================
 
-_dock_widget: Optional[QtWidgets.QDockWidget] = None
+_dialog: Optional[SkinExporterDialog] = None
+_action: Optional[Any] = None   # QAction in SP's Python menu
 
 
 def start_plugin():
-    global _dock_widget
-    scroll = QtWidgets.QScrollArea()
-    scroll.setWidgetResizable(True)
-    scroll.setWidget(SkinExporterWidget())
-    _dock_widget = QtWidgets.QDockWidget(PLUGIN_NAME)
-    _dock_widget.setObjectName("SkinPackExporterDock")
-    _dock_widget.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-    _dock_widget.setWidget(scroll)
-    sp_ui.add_dock_widget(_dock_widget)
+    global _dialog, _action
+
+    # Register a menu action so the user can re-open the window at any time
+    _action = QtWidgets.QAction(PLUGIN_NAME, sp_ui.get_main_window())
+    _action.triggered.connect(_show_window)
+    sp_ui.add_action("Python/Plugins", _action)
+
+    # Open the window immediately on plugin load
+    _show_window()
     _log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} loaded.")
 
 
+def _show_window():
+    """Open or bring the floating window to the front."""
+    global _dialog
+    if _dialog is None or not _dialog.isVisible():
+        _dialog = SkinExporterDialog(sp_ui.get_main_window())
+    _dialog.show()
+    _dialog.raise_()
+    _dialog.activateWindow()
+
+
 def close_plugin():
-    global _dock_widget
-    if _dock_widget is not None:
-        sp_ui.delete_ui_element(_dock_widget)
-        _dock_widget = None
+    global _dialog, _action
+    if _dialog is not None:
+        _dialog.close()
+        _dialog = None
+    if _action is not None:
+        sp_ui.delete_ui_element(_action)
+        _action = None
     _log(f"{PLUGIN_NAME} unloaded.")
 
 
