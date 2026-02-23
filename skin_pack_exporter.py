@@ -48,7 +48,7 @@ import substance_painter.project    as sp_project
 import substance_painter.textureset as sp_textureset
 import substance_painter.export     as sp_export
 import substance_painter.logging    as sp_log
-import substance_painter.js         as sp_js
+import substance_painter.layerstack as sp_layerstack
 
 
 # =============================================================================
@@ -97,446 +97,248 @@ def _log(msg: str, level: str = "info"):
 #    alg.layers.selectedLayers(stack)   -> [LayerNode]
 # =============================================================================
 
-def _js(code: str) -> Any:
-    """Run code in SP's JS engine. Returns None and logs on error."""
-    try:
-        return sp_js.evaluate(code)
-    except Exception as exc:
-        _log(f"JS error: {exc}\n--- code ---\n{code[:400]}", "error")
-        return None
-
-
-# ---------------------------------------------------------------------------
-#  DIAGNOSTIC: run a minimal JS call to verify the bridge is working and
-#  return what API surface is available. Helps debug "layer tree" failures.
-# ---------------------------------------------------------------------------
-_JS_DIAG = """
-(function(tsName) {
-    var result = {
-        algExists:          typeof alg !== "undefined",
-        texsetsExists:      typeof alg !== "undefined" && typeof alg.texturesets !== "undefined",
-        layersExists:       typeof alg !== "undefined" && typeof alg.layers !== "undefined",
-        stackFnExists:      false,
-        stackResult:        null,
-        nodesResult:        null,
-        selectedFnExists:   false,
-        error:              null
-    };
-    try {
-        result.stackFnExists  = typeof alg.texturesets.stack === "function";
-        result.selectedFnExists = typeof alg.layers.selectedLayers === "function";
-        if (result.stackFnExists) {
-            var s = alg.texturesets.stack(tsName);
-            result.stackResult = s ? "ok" : "null";
-            if (s) {
-                var nodes = alg.layers.nodes(s);
-                result.nodesResult = nodes ? ("count:" + nodes.length) : "null";
-            }
-        }
-    } catch(e) { result.error = e.toString(); }
-    return JSON.stringify(result);
-})(TSNAME)
-"""
-
-# ---------------------------------------------------------------------------
-#  GET FULL LAYER TREE
-#  Returns list of {name, type, visible, children, maskNodes, effects}
-# ---------------------------------------------------------------------------
-_JS_GET_TREE = """
-(function(tsName) {
-    if (typeof alg === "undefined" || typeof alg.texturesets === "undefined")
-        return JSON.stringify({error: "alg not available"});
-
-    var stack = alg.texturesets.stack(tsName);
-    if (!stack) return JSON.stringify({error: "stack_null"});
-
-    function getEffects(node) {
-        var out = [];
-        try {
-            var efx = alg.layers.effects(node) || [];
-            for (var i = 0; i < efx.length; i++) {
-                out.push({
-                    index:   i,
-                    name:    efx[i].name || ("effect_" + i),
-                    enabled: alg.layers.isEffectEnabled(efx[i])
-                });
-            }
-        } catch(e) {}
-        return out;
-    }
-
-    function getMaskKids(node) {
-        var out = [];
-        try {
-            var mask = alg.layers.maskNodes(node) || [];
-            for (var i = 0; i < mask.length; i++) {
-                out.push({
-                    name:      mask[i].name || "",
-                    type:      "MaskNode",
-                    visible:   alg.layers.visibility(mask[i]),
-                    children:  [],
-                    maskNodes: [],
-                    effects:   []
-                });
-            }
-        } catch(e) {}
-        return out;
-    }
-
-    function walk(parent) {
-        var nodes = alg.layers.nodes(parent) || [];
-        var result = [];
-        for (var i = 0; i < nodes.length; i++) {
-            var n = nodes[i];
-            result.push({
-                name:      n.name || ("layer_" + i),
-                type:      n.type || "Unknown",
-                visible:   alg.layers.visibility(n),
-                children:  walk(n),
-                maskNodes: getMaskKids(n),
-                effects:   getEffects(n)
-            });
-        }
-        return result;
-    }
-
-    return JSON.stringify({ok: true, tree: walk(stack)});
-})(TSNAME)
-"""
-
-# ---------------------------------------------------------------------------
-#  GET SELECTED LAYER NAME
-#  Returns the name of the first currently-selected layer in SP's layer panel.
-# ---------------------------------------------------------------------------
-_JS_GET_SELECTED = """
-(function(tsName) {
-    if (typeof alg === "undefined") return JSON.stringify({error: "alg_missing"});
-    try {
-        var stack    = alg.texturesets.stack(tsName);
-        if (!stack)  return JSON.stringify({error: "stack_null"});
-        var selected = alg.layers.selectedLayers(stack);
-        if (!selected || selected.length === 0)
-            return JSON.stringify({error: "nothing_selected"});
-        return JSON.stringify({ok: true, name: selected[0].name || ""});
-    } catch(e) {
-        return JSON.stringify({error: e.toString()});
-    }
-})(TSNAME)
-"""
-
-# ---------------------------------------------------------------------------
-#  SNAPSHOT visibility for the whole stack ({path: bool})
-# ---------------------------------------------------------------------------
-_JS_SNAPSHOT = """
-(function(tsName) {
-    var stack = alg.texturesets.stack(tsName);
-    if (!stack) return JSON.stringify({});
-    var snap = {};
-
-    function walk(parent, prefix) {
-        var nodes = alg.layers.nodes(parent) || [];
-        for (var i = 0; i < nodes.length; i++) {
-            var n   = nodes[i];
-            var nm  = n.name || ("layer_" + i);
-            var pth = prefix ? (prefix + "|" + nm) : nm;
-            snap[pth] = alg.layers.visibility(n);
-            walk(n, pth);
-            try {
-                var mask = alg.layers.maskNodes(n) || [];
-                for (var j = 0; j < mask.length; j++) {
-                    var mnm = mask[j].name || ("m" + j);
-                    snap[pth + "|__mask__|" + mnm] = alg.layers.visibility(mask[j]);
-                }
-            } catch(e) {}
-        }
-    }
-
-    walk(stack, "");
-    return JSON.stringify(snap);
-})(TSNAME)
-"""
-
-# ---------------------------------------------------------------------------
-#  RESTORE visibility from snapshot
-# ---------------------------------------------------------------------------
-_JS_RESTORE = """
-(function(tsName, snapJson) {
-    var snap  = JSON.parse(snapJson);
-    var stack = alg.texturesets.stack(tsName);
-    if (!stack) return false;
-
-    function nodeByPath(root, parts) {
-        if (!parts.length) return root;
-        var nodes = alg.layers.nodes(root) || [];
-        for (var i = 0; i < nodes.length; i++) {
-            if ((nodes[i].name || ("layer_" + i)) === parts[0])
-                return nodeByPath(nodes[i], parts.slice(1));
-        }
-        return null;
-    }
-
-    function maskNodeByPath(root, parts) {
-        var nodes = alg.layers.nodes(root) || [];
-        for (var i = 0; i < nodes.length; i++) {
-            var n  = nodes[i];
-            var nm = n.name || ("layer_" + i);
-            if (nm === parts[0]) {
-                if (parts[1] === "__mask__") {
-                    var mask = alg.layers.maskNodes(n) || [];
-                    for (var j = 0; j < mask.length; j++) {
-                        if ((mask[j].name || ("m" + j)) === parts[2]) return mask[j];
-                    }
-                    return null;
-                }
-                return maskNodeByPath(n, parts.slice(1));
-            }
-        }
-        return null;
-    }
-
-    for (var path in snap) {
-        if (!snap.hasOwnProperty(path)) continue;
-        var parts = path.split("|");
-        var node  = parts.indexOf("__mask__") !== -1
-                      ? maskNodeByPath(stack, parts)
-                      : nodeByPath(stack, parts);
-        if (node) {
-            try { alg.layers.setVisibility(node, snap[path]); } catch(e) {}
-        }
-    }
-    return true;
-})(TSNAME, SNAP)
-"""
-
-# ---------------------------------------------------------------------------
-#  SCAN for Invert filter on a named layer
-# ---------------------------------------------------------------------------
-_JS_SCAN_INVERT = """
-(function(tsName, layerPath) {
-    var stack = alg.texturesets.stack(tsName);
-    if (!stack) return JSON.stringify({found:false, index:-1, names:[]});
-
-    var parts = layerPath.split("|");
-    var cur   = stack;
-    for (var i = 0; i < parts.length; i++) {
-        var nodes = alg.layers.nodes(cur) || [];
-        var next  = null;
-        for (var j = 0; j < nodes.length; j++) {
-            if (nodes[j].name === parts[i]) { next = nodes[j]; break; }
-        }
-        if (!next) return JSON.stringify({found:false, index:-1, names:[]});
-        cur = next;
-    }
-
-    var efx   = [];
-    try { efx = alg.layers.effects(cur) || []; } catch(e) {}
-    var names = [];
-    var found = -1;
-    for (var k = 0; k < efx.length; k++) {
-        var nm = efx[k].name || ("effect_" + k);
-        names.push(nm);
-        if (found === -1 && nm.toLowerCase().indexOf("invert") !== -1) found = k;
-    }
-    return JSON.stringify({found: found !== -1, index: found, names: names});
-})(TSNAME, LAYERPATH)
-"""
-
-# ---------------------------------------------------------------------------
-#  APPLY EXPORT STATE for one task
-# ---------------------------------------------------------------------------
-_JS_APPLY_STATE = """
-(function(tsName, cfg) {
-    var stack = alg.texturesets.stack(tsName);
-    if (!stack) return "error:no_stack";
-
-    function byPath(root, pathStr) {
-        if (!pathStr) return null;
-        var parts = pathStr.split("|");
-        var cur   = root;
-        for (var i = 0; i < parts.length; i++) {
-            var nodes = alg.layers.nodes(cur) || [];
-            var found = null;
-            for (var j = 0; j < nodes.length; j++) {
-                if (nodes[j].name === parts[i]) { found = nodes[j]; break; }
-            }
-            if (!found) return null;
-            cur = found;
-        }
-        return cur;
-    }
-
-    // Show one child inside a group, hide all others.
-    // If childName is empty/null, hide the group entirely.
-    function isolateChild(groupPath, childName) {
-        var group = byPath(stack, groupPath);
-        if (!group) return;
-        var show = (childName !== null && childName !== "");
-        alg.layers.setVisibility(group, show);
-        if (!show) return;
-        var kids = alg.layers.nodes(group) || [];
-        for (var i = 0; i < kids.length; i++) {
-            alg.layers.setVisibility(kids[i], kids[i].name === childName);
-        }
-    }
-
-    function hideGroup(groupPath) {
-        var g = byPath(stack, groupPath);
-        if (g) alg.layers.setVisibility(g, false);
-    }
-
-    // 1. Text fill layer --------------------------------------------------
-    if (cfg.textLayerPath) {
-        var textNode = byPath(stack, cfg.textLayerPath);
-        if (textNode) {
-            if (cfg.invertIdx >= 0) {
-                try {
-                    var efx = alg.layers.effects(textNode) || [];
-                    if (efx[cfg.invertIdx]) {
-                        alg.layers.setEffectEnabled(efx[cfg.invertIdx], cfg.invertOn);
-                    }
-                } catch(e) {}
-            }
-            if (cfg.wornPaintName) {
-                try {
-                    var mask = alg.layers.maskNodes(textNode) || [];
-                    for (var mi = 0; mi < mask.length; mi++) {
-                        if (mask[mi].name === cfg.wornPaintName) {
-                            alg.layers.setVisibility(mask[mi], cfg.wornPaintOn);
-                        }
-                    }
-                } catch(e) {}
-            }
-        }
-    }
-
-    // 2. Black Parts folder -----------------------------------------------
-    if (cfg.blackPartsPath) {
-        var bp = byPath(stack, cfg.blackPartsPath);
-        if (bp) {
-            alg.layers.setVisibility(bp, true);
-            var bpKids = alg.layers.nodes(bp) || [];
-            for (var bi = 0; bi < bpKids.length; bi++) {
-                var bname = bpKids[bi].name;
-                if (bname === cfg.blackWornName) {
-                    alg.layers.setVisibility(bpKids[bi], cfg.blackWornOn);
-                } else if (bname === cfg.blackName) {
-                    alg.layers.setVisibility(bpKids[bi], true);
-                }
-            }
-        }
-    }
-
-    // 3. Skin Pack folder -------------------------------------------------
-    if (cfg.skinPackPath) {
-        var sp = byPath(stack, cfg.skinPackPath);
-        if (sp) {
-            // default/default_worn: hide the entire skin pack
-            alg.layers.setVisibility(sp, !cfg.isDefault);
-
-            if (!cfg.isDefault) {
-                var normPath   = cfg.skinPackPath + "|" + cfg.normalFolderName;
-                var wPlasPath  = cfg.skinPackPath + "|" + cfg.wornPlasticName;
-                var wMetPath   = cfg.skinPackPath + "|" + cfg.wornMetalName;
-                var brightPath = cfg.skinPackPath + "|" + cfg.brightFolderName;
-
-                if (cfg.type === "normal") {
-                    isolateChild(normPath,   cfg.activeSkin);
-                    hideGroup(wPlasPath);
-                    hideGroup(wMetPath);
-                    hideGroup(brightPath);
-                } else if (cfg.type === "worn") {
-                    // Normal hidden entirely; both worn folders active simultaneously
-                    hideGroup(normPath);
-                    isolateChild(wPlasPath, cfg.wornPlasticSkin);
-                    isolateChild(wMetPath,  cfg.wornMetalSkin);
-                    hideGroup(brightPath);
-                } else if (cfg.type === "bright") {
-                    hideGroup(normPath);
-                    hideGroup(wPlasPath);
-                    hideGroup(wMetPath);
-                    isolateChild(brightPath, cfg.activeSkin);
-                }
-            }
-        }
-    }
-
-    return "ok";
-})(TSNAME, CFG)
-"""
-
-
 # =============================================================================
-#  PYTHON HELPERS
+#  NATIVE PYTHON LAYER API (Replaces JS Bridge)
 # =============================================================================
 
-def _build_js(template: str, subs: Dict[str, str]) -> str:
-    code = template
-    for k, v in subs.items():
-        code = code.replace(k, v)
-    return code
+def get_node_name(node):
+    if hasattr(node, 'name'):
+        return node.name() if callable(node.name) else node.name
+    return str(getattr(node, 'uid', lambda: "unknown")())
 
+def get_node_enabled(node):
+    if hasattr(node, 'is_enabled'):
+        return node.is_enabled()
+    return getattr(node, 'enabled', True)
 
-def _jparse(raw: Any) -> Optional[Dict]:
-    """Parse a JS result that may be a str or already a dict."""
-    if raw is None:
-        return None
+def set_node_enabled(node, enabled):
+    if hasattr(node, 'set_enabled'):
+        node.set_enabled(enabled)
+    else:
+        node.enabled = enabled
+
+def _find_node_by_path(stack, pathStr: str):
+    if not pathStr: return None
+    parts = pathStr.split("|")
+    current_nodes = sp_layerstack.get_root_layer_nodes(stack)
+    found = None
+    for part in parts:
+        found = None
+        for n in current_nodes:
+            if get_node_name(n) == part:
+                found = n
+                break
+        if not found: return None
+        if hasattr(found, 'sub_layers'):
+            current_nodes = found.sub_layers()
+        else:
+            current_nodes = []
+    return found
+
+def _get_ts_stack(ts_name: str):
+    for ts in sp_textureset.all_texture_sets():
+        if ts.name() == ts_name:
+            return ts.get_stack()
+    return None
+
+def _run_diag(ts_name: str) -> dict:
+    out = {
+        "Python API Version": sp_project.application.version() if hasattr(sp_project, 'application') else "unknown",
+        "LayerStack Supported": hasattr(sp_layerstack, 'get_root_layer_nodes'),
+    }
     try:
-        return json.loads(raw) if isinstance(raw, str) else raw
-    except Exception:
+        stack = _get_ts_stack(ts_name)
+        out["Target TS Found"] = stack is not None
+        if stack:
+            nodes = sp_layerstack.get_root_layer_nodes(stack)
+            out["Root Nodes Count"] = len(nodes)
+            if nodes:
+                out["Test Name()"] = get_node_name(nodes[0])
+                out["Test is_enabled()"] = get_node_enabled(nodes[0])
+    except Exception as e:
+        out["Error"] = str(e)
+    return out
+
+def _build_tree(nodes):
+    tree = []
+    for n in nodes:
+        name = get_node_name(n)
+        visible = get_node_enabled(n)
+        ntype = str(getattr(n, 'get_type', lambda: "Unknown")()).split('.')[-1]
+        
+        children = []
+        if ntype == "GroupLayer" and hasattr(n, 'sub_layers'):
+            children = _build_tree(n.sub_layers())
+            
+        mask_nodes = []
+        if hasattr(n, 'mask_effects'):
+            for me in n.mask_effects():
+                mask_nodes.append({
+                    "name": get_node_name(me),
+                    "type": "MaskNode",
+                    "visible": get_node_enabled(me),
+                    "uid": me.uid(),
+                    "children": [], "maskNodes": [], "effects": []
+                })
+                
+        effects = []
+        if hasattr(n, 'content_effects'):
+            for i, ce in enumerate(n.content_effects()):
+                effects.append({
+                    "index": i, "name": get_node_name(ce),
+                    "enabled": get_node_enabled(ce), "uid": ce.uid()
+                })
+                
+        tree.append({
+            "name": name, "type": ntype, "visible": visible,
+            "uid": n.uid(), "children": children,
+            "maskNodes": mask_nodes, "effects": effects
+        })
+    return tree
+
+def _get_layer_tree(ts_name: str):
+    stack = _get_ts_stack(ts_name)
+    if not stack: return None
+    try:
+        nodes = sp_layerstack.get_root_layer_nodes(stack)
+        return _build_tree(nodes)
+    except Exception as e:
+        sp_log.error(f"Layer tree error: {e}")
         return None
 
+def _get_selected_layer(ts_name: str) -> str:
+    stack = _get_ts_stack(ts_name)
+    if not stack: return None
+    try:
+        sel = sp_layerstack.get_selected_nodes(stack)
+        if sel: return get_node_name(sel[0])
+    except Exception as e:
+        sp_log.error(f"Get selected error: {e}")
+    return None
 
-def _run_diag(ts_name: str) -> Dict:
-    raw = _js(_build_js(_JS_DIAG, {"TSNAME": json.dumps(ts_name)}))
-    return _jparse(raw) or {"error": "evaluate returned None"}
-
-
-def _get_layer_tree(ts_name: str) -> Optional[List[Dict]]:
-    raw  = _js(_build_js(_JS_GET_TREE, {"TSNAME": json.dumps(ts_name)}))
-    data = _jparse(raw)
-    if data is None:
-        return None
-    if "error" in data:
-        _log(f"get_layer_tree JS error: {data['error']}", "error")
-        return None
-    return data.get("tree", [])
-
-
-def _get_selected_layer(ts_name: str) -> Optional[str]:
-    raw  = _js(_build_js(_JS_GET_SELECTED, {"TSNAME": json.dumps(ts_name)}))
-    data = _jparse(raw)
-    if data is None or "error" in data:
-        return None
-    return data.get("name")
-
+_snap_state = {}
 
 def _snapshot_visibility(ts_name: str) -> str:
-    raw = _js(_build_js(_JS_SNAPSHOT, {"TSNAME": json.dumps(ts_name)}))
-    if raw is None:
-        return "{}"
-    return raw if isinstance(raw, str) else json.dumps(raw)
-
+    global _snap_state
+    _snap_state.clear()
+    stack = _get_ts_stack(ts_name)
+    if not stack: return "{}"
+    
+    def walk(nodes):
+        for n in nodes:
+            _snap_state[n.uid()] = get_node_enabled(n)
+            if hasattr(n, 'sub_layers'): walk(n.sub_layers())
+            if hasattr(n, 'mask_effects'):
+                for me in n.mask_effects(): _snap_state[me.uid()] = get_node_enabled(me)
+            if hasattr(n, 'content_effects'):
+                for ce in n.content_effects(): _snap_state[ce.uid()] = get_node_enabled(ce)
+                
+    walk(sp_layerstack.get_root_layer_nodes(stack))
+    return "ok"
 
 def _restore_visibility(ts_name: str, snap: str):
-    _js(_build_js(_JS_RESTORE, {"TSNAME": json.dumps(ts_name), "SNAP": snap}))
+    global _snap_state
+    if not _snap_state: return
+    stack = _get_ts_stack(ts_name)
+    if not stack: return
+    
+    def walk(nodes):
+        for n in nodes:
+            if n.uid() in _snap_state: set_node_enabled(n, _snap_state[n.uid()])
+            if hasattr(n, 'sub_layers'): walk(n.sub_layers())
+            if hasattr(n, 'mask_effects'):
+                for me in n.mask_effects():
+                    if me.uid() in _snap_state: set_node_enabled(me, _snap_state[me.uid()])
+            if hasattr(n, 'content_effects'):
+                for ce in n.content_effects():
+                    if ce.uid() in _snap_state: set_node_enabled(ce, _snap_state[ce.uid()])
 
+    with sp_layerstack.ScopedModification("Restore Visibility"):
+        walk(sp_layerstack.get_root_layer_nodes(stack))
 
-def _scan_for_invert(ts_name: str, layer_path: str) -> Dict:
-    raw  = _js(_build_js(_JS_SCAN_INVERT, {
-        "TSNAME":    json.dumps(ts_name),
-        "LAYERPATH": json.dumps(layer_path),
-    }))
-    return _jparse(raw) or {"found": False, "index": -1, "names": []}
+def _scan_for_invert(ts_name: str, layer_path: str) -> dict:
+    stack = _get_ts_stack(ts_name)
+    if not stack: return {"found": False, "index": -1, "names": []}
+    
+    node = _find_node_by_path(stack, layer_path)
+    if not node: return {"found": False, "index": -1, "names": []}
+    
+    names = []
+    found = -1
+    if hasattr(node, 'content_effects'):
+        for i, ce in enumerate(node.content_effects()):
+            nm = get_node_name(ce)
+            names.append(nm)
+            if found == -1 and "invert" in nm.lower():
+                found = i
+                
+    return {"found": found != -1, "index": found, "names": names}
 
+def _isolate_child(group_node, childName):
+    if not hasattr(group_node, 'sub_layers'): return
+    show = bool(childName)
+    set_node_enabled(group_node, show)
+    if not show: return
+    for kid in group_node.sub_layers():
+        set_node_enabled(kid, get_node_name(kid) == childName)
 
-def _apply_export_state(ts_name: str, cfg: Dict):
-    result = _js(_build_js(_JS_APPLY_STATE, {
-        "TSNAME": json.dumps(ts_name),
-        "CFG":    json.dumps(cfg),
-    }))
-    if result != "ok":
-        _log(f"apply_state returned: {result}", "warn")
-
+def _apply_export_state(ts_name: str, cfg: dict):
+    stack = _get_ts_stack(ts_name)
+    if not stack: return
+    
+    with sp_layerstack.ScopedModification("Skin Pack Exporter State"):
+        text_node = _find_node_by_path(stack, cfg.get("textLayerPath"))
+        if text_node:
+            idx = cfg.get("invertIdx", -1)
+            if idx >= 0 and hasattr(text_node, 'content_effects'):
+                efx = list(text_node.content_effects())
+                if idx < len(efx):
+                    set_node_enabled(efx[idx], cfg.get("invertOn", True))
+                    
+            worn_paint = cfg.get("wornPaintName")
+            if worn_paint and hasattr(text_node, 'mask_effects'):
+                for me in text_node.mask_effects():
+                    if get_node_name(me) == worn_paint:
+                        set_node_enabled(me, cfg.get("wornPaintOn", False))
+                        
+        bp_node = _find_node_by_path(stack, cfg.get("blackPartsPath"))
+        if bp_node:
+            set_node_enabled(bp_node, True)
+            if hasattr(bp_node, 'sub_layers'):
+                bname = cfg.get("blackName")
+                bwname = cfg.get("blackWornName")
+                for kid in bp_node.sub_layers():
+                    kn = get_node_name(kid)
+                    if kn == bwname: set_node_enabled(kid, cfg.get("blackWornOn", False))
+                    elif kn == bname: set_node_enabled(kid, True)
+                    
+        sp_node = _find_node_by_path(stack, cfg.get("skinPackPath"))
+        if sp_node:
+            is_def = cfg.get("isDefault", False)
+            set_node_enabled(sp_node, not is_def)
+            
+            if not is_def:
+                n_node = _find_node_by_path(stack, cfg.get("skinPackPath") + "|" + cfg.get("normalFolderName"))
+                wp_node = _find_node_by_path(stack, cfg.get("skinPackPath") + "|" + cfg.get("wornPlasticName"))
+                wm_node = _find_node_by_path(stack, cfg.get("skinPackPath") + "|" + cfg.get("wornMetalName"))
+                br_node = _find_node_by_path(stack, cfg.get("skinPackPath") + "|" + cfg.get("brightFolderName"))
+                
+                ttype = cfg.get("type")
+                if ttype == "normal":
+                    if n_node: _isolate_child(n_node, cfg.get("activeSkin"))
+                    if wp_node: set_node_enabled(wp_node, False)
+                    if wm_node: set_node_enabled(wm_node, False)
+                    if br_node: set_node_enabled(br_node, False)
+                elif ttype == "worn":
+                    if n_node: set_node_enabled(n_node, False)
+                    if wp_node: _isolate_child(wp_node, cfg.get("wornPlasticSkin"))
+                    if wm_node: _isolate_child(wm_node, cfg.get("wornMetalSkin"))
+                    if br_node: set_node_enabled(br_node, False)
+                elif ttype == "bright":
+                    if n_node: set_node_enabled(n_node, False)
+                    if wp_node: set_node_enabled(wp_node, False)
+                    if wm_node: set_node_enabled(wm_node, False)
+                    if br_node: _isolate_child(br_node, cfg.get("activeSkin"))
 
 # =============================================================================
 #  NAME UTILITIES
