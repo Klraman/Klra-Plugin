@@ -359,7 +359,10 @@ class TextureExporterWindow(QWidget):
                 {
                     "parameters": {
                         "fileFormat": sp_fmt,
-                        "bitDepth":   bit_depth,
+                        "bitDepth":   "8",
+                        "dithering": False,
+                        "paddingAlgorithm": "infinite",
+                        "dilationDistance": 16,
                     }
                 }
             ]
