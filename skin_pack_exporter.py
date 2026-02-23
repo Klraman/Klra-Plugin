@@ -1,77 +1,66 @@
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║              SKIN PACK EXPORTER — Substance Painter Plugin                 ║
-║              Version 1.0.0  |  Compatible with SP 11.1.2+                  ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  INSTALLATION:                                                               ║
-║    Place this file in:                                                       ║
-║    %USERPROFILE%/Documents/Adobe/Adobe Substance 3D Painter/                ║
-║                 python/plugins/skin_pack_exporter.py                        ║
-║                                                                              ║
-║    Then in Substance Painter:                                                ║
-║    Python > Plugins > Skin Pack Exporter                                     ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+Skin Pack Exporter -- Substance Painter Plugin v1.1.0
+Compatible with SP 11.1.2+
 
-WORKFLOW OVERVIEW
-─────────────────
-This plugin automates batch-exporting skin textures by toggling layer
-visibility and filter states in your layer stack, then calling SP's export
-API for each combination.
+INSTALLATION:
+  Place this file in:
+  %USERPROFILE%/Documents/Adobe/Adobe Substance 3D Painter/python/plugins/skin_pack_exporter.py
 
-EXPORT TYPES
-────────────
-  normal       → Single skin from Normal folder
-                 Text: Invert ON, Worn OFF | Black Worn: OFF
-  worn         → Paired Plastic + Metal worn layers exported simultaneously
-                 Text: Invert ON, Worn ON  | Black Worn: ON
-  bright       → Single skin from Bright folder
-                 Text: Invert OFF, Worn OFF | Black Worn: OFF
-  default      → Black Parts only (black layer)
-                 Text: Invert ON, Worn OFF  | Black Worn: OFF
-  default_worn → Black Parts only (black worn layer)
-                 Text: Invert ON, Worn ON   | Black Worn: ON
+  Then in Substance Painter: Python > Plugins > Skin Pack Exporter
 
-NAME MAPPING
-────────────
-  '!Skin Tan (Metal)'         → 'Tan'
-  '!Skin Tan Worn (Plastic)'  → 'Tan Worn'
-  '!Skin Black (Any Mat)'     → 'Default'
-  '!Skin Black Worn (Metal)'  → 'Default Worn'
-  '!Skin Gold (Any Mat)'      → 'Gold'
+API NOTE:
+  SP's Python SDK does NOT expose substance_painter.layers.
+  All layer manipulation goes through substance_painter.js.evaluate()
+  which runs code inside SP's JavaScript engine (alg.* namespace).
+
+EXPORT TYPES:
+  normal       : Text invert ON,  worn OFF, black worn OFF  | Normal folder
+  worn         : Text invert ON,  worn ON,  black worn ON   | Worn (Plastic) + Worn (Metal)
+  bright       : Text invert OFF, worn OFF, black worn OFF  | Bright folder
+  default      : Text invert ON,  worn OFF, black worn OFF  | Black Parts only
+  default_worn : Text invert ON,  worn ON,  black worn ON   | Black Parts only
+
+NAME MAPPING:
+  !Skin Tan (Metal)        -> Tan
+  !Skin Tan Worn (Plastic) -> Tan Worn
+  !Skin Black (Any Mat)    -> Default
+  !Skin Black Worn (Metal) -> Default Worn
+  !Skin Gold (Any Mat)     -> Gold
 """
 
 import os
 import re
+import json
 import glob
 import traceback
-from copy import deepcopy
-from typing import Optional, List, Dict, Tuple, Any
+from typing import Optional, List, Dict, Any
 
-# ── Qt import (SP 11 ships PySide2; fall back to PySide6 just in case) ────────
+# -- Qt (SP 11 ships PySide2; PySide6 fallback just in case) ------------------
 try:
     from PySide2 import QtWidgets, QtCore, QtGui
     from PySide2.QtCore import Qt
 except ImportError:
-    from PySide6 import QtWidgets, QtCore, QtGui  # type: ignore
+    from PySide6 import QtWidgets, QtCore, QtGui   # type: ignore
     from PySide6.QtCore import Qt
 
-# ── Substance Painter API ─────────────────────────────────────────────────────
-import substance_painter
-import substance_painter.ui       as sp_ui
-import substance_painter.project  as sp_project
+# -- Substance Painter Python API ---------------------------------------------
+# NOTE: substance_painter.layers does NOT exist in SP 11.
+# Layer access must go through the JavaScript bridge (substance_painter.js).
+import substance_painter.ui         as sp_ui
+import substance_painter.project    as sp_project
 import substance_painter.textureset as sp_textureset
-import substance_painter.export   as sp_export
-import substance_painter.layers   as sp_layers
-import substance_painter.logging  as sp_log
+import substance_painter.export     as sp_export
+import substance_painter.logging    as sp_log
+import substance_painter.js         as sp_js   # JS bridge for layer ops
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
+# =============================================================================
 #  CONSTANTS
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 PLUGIN_NAME    = "Skin Pack Exporter"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 
-# Default layer/folder names (user can override in the UI)
 DEFAULT_SKIN_PACK_NAME  = "!!Skin Pack (All)"
 DEFAULT_TEXT_LAYER      = "Text"
 DEFAULT_BLACK_PARTS     = "Black Parts"
@@ -79,250 +68,500 @@ DEFAULT_NORMAL_FOLDER   = "Normal"
 DEFAULT_WORN_PLASTIC    = "Worn (Plastic)"
 DEFAULT_WORN_METAL      = "Worn (Metal)"
 DEFAULT_BRIGHT_FOLDER   = "Bright"
-DEFAULT_WORN_PAINT      = "Worn"          # Name of the paint layer inside Text's mask
+DEFAULT_WORN_PAINT      = "Worn"
 DEFAULT_EXPORT_TEMPLATE = "Base Color"
 
-# Regex: strip trailing material-type suffix from a skin name
-# Handles: (Any Mat)  (Metal)  (Plastic)  and any truncated variant like (Pla...
 _RE_SUFFIX = re.compile(r'\s*\([^)]*\)\s*$')
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  LOGGING
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def _log(msg: str, level: str = "info"):
-    """Write to SP's internal log."""
     lvl = {"info": sp_log.INFO, "warn": sp_log.WARNING, "error": sp_log.ERROR}
     sp_log.log(lvl.get(level, sp_log.INFO), PLUGIN_NAME, str(msg))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+#  JAVASCRIPT BRIDGE
+#  sp_js.evaluate(code) runs code in SP's built-in JS engine and returns the
+#  result.  We JSON.stringify complex objects on the JS side so Python always
+#  receives plain strings it can json.loads().
+# =============================================================================
+
+def _js(code: str) -> Any:
+    """Evaluate JS in SP's engine. Returns None and logs on failure."""
+    try:
+        return sp_js.evaluate(code)
+    except Exception as exc:
+        _log(f"JS evaluate error: {exc}\nCode: {code[:300]}", "error")
+        return None
+
+
+# ---------------------------------------------------------------------------
+#  JS: get full layer tree as JSON
+#  Returns a list of node dicts: {name, type, visible, children, maskNodes,
+#  effects:[{index,name,enabled}]}
+# ---------------------------------------------------------------------------
+_JS_GET_TREE = """
+(function(tsName) {
+    var stack = alg.texturesets.stack(tsName);
+    if (!stack) return JSON.stringify([]);
+
+    function getEffects(node) {
+        var out = [];
+        try {
+            var efx = alg.layers.effects(node) || [];
+            for (var i = 0; i < efx.length; i++) {
+                out.push({
+                    index:   i,
+                    name:    efx[i].name || ("effect_" + i),
+                    enabled: alg.layers.isEffectEnabled(efx[i])
+                });
+            }
+        } catch(e) {}
+        return out;
+    }
+
+    function getMaskKids(node) {
+        var out = [];
+        try {
+            var mask = alg.layers.maskNodes(node) || [];
+            for (var i = 0; i < mask.length; i++) {
+                out.push({
+                    name:     mask[i].name || "",
+                    type:     "MaskNode",
+                    visible:  alg.layers.visibility(mask[i]),
+                    children: [],
+                    maskNodes:[],
+                    effects:  []
+                });
+            }
+        } catch(e) {}
+        return out;
+    }
+
+    function walk(parent) {
+        var nodes = alg.layers.nodes(parent) || [];
+        var result = [];
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            result.push({
+                name:      n.name || ("layer_" + i),
+                type:      n.type || "Unknown",
+                visible:   alg.layers.visibility(n),
+                children:  walk(n),
+                maskNodes: getMaskKids(n),
+                effects:   getEffects(n)
+            });
+        }
+        return result;
+    }
+
+    return JSON.stringify(walk(stack));
+})(TSNAME)
+"""
+
+# ---------------------------------------------------------------------------
+#  JS: lightweight name+type+children tree (for the layer picker dialog)
+# ---------------------------------------------------------------------------
+_JS_NAME_TREE = """
+(function(tsName) {
+    var stack = alg.texturesets.stack(tsName);
+    if (!stack) return JSON.stringify([]);
+    function walk(parent) {
+        var nodes = alg.layers.nodes(parent) || [];
+        var out = [];
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i];
+            out.push({
+                name:     n.name || ("layer_" + i),
+                type:     n.type || "Unknown",
+                children: walk(n)
+            });
+        }
+        return out;
+    }
+    return JSON.stringify(walk(stack));
+})(TSNAME)
+"""
+
+# ---------------------------------------------------------------------------
+#  JS: snapshot all visibility values into a {path: bool} JSON map
+#  'path' uses "|" as a separator.  Mask children use the sentinel __mask__.
+# ---------------------------------------------------------------------------
+_JS_SNAPSHOT = """
+(function(tsName) {
+    var stack = alg.texturesets.stack(tsName);
+    if (!stack) return JSON.stringify({});
+    var snap = {};
+
+    function walk(parent, prefix) {
+        var nodes = alg.layers.nodes(parent) || [];
+        for (var i = 0; i < nodes.length; i++) {
+            var n   = nodes[i];
+            var nm  = n.name || ("layer_" + i);
+            var pth = prefix ? (prefix + "|" + nm) : nm;
+            snap[pth] = alg.layers.visibility(n);
+            walk(n, pth);
+            try {
+                var mask = alg.layers.maskNodes(n) || [];
+                for (var j = 0; j < mask.length; j++) {
+                    var mn  = mask[j];
+                    var mnm = mn.name || ("m" + j);
+                    snap[pth + "|__mask__|" + mnm] = alg.layers.visibility(mn);
+                }
+            } catch(e) {}
+        }
+    }
+
+    walk(stack, "");
+    return JSON.stringify(snap);
+})(TSNAME)
+"""
+
+# ---------------------------------------------------------------------------
+#  JS: restore visibility from a {path: bool} snapshot
+# ---------------------------------------------------------------------------
+_JS_RESTORE = """
+(function(tsName, snapJson) {
+    var snap  = JSON.parse(snapJson);
+    var stack = alg.texturesets.stack(tsName);
+    if (!stack) return false;
+
+    function nodeByPath(root, parts) {
+        if (!parts.length) return root;
+        var nodes = alg.layers.nodes(root) || [];
+        for (var i = 0; i < nodes.length; i++) {
+            if ((nodes[i].name || ("layer_" + i)) === parts[0]) {
+                return nodeByPath(nodes[i], parts.slice(1));
+            }
+        }
+        return null;
+    }
+
+    function maskNodeByPath(root, parts) {
+        var nodes = alg.layers.nodes(root) || [];
+        for (var i = 0; i < nodes.length; i++) {
+            var n  = nodes[i];
+            var nm = n.name || ("layer_" + i);
+            if (nm === parts[0]) {
+                if (parts[1] === "__mask__") {
+                    var mask = alg.layers.maskNodes(n) || [];
+                    for (var j = 0; j < mask.length; j++) {
+                        if ((mask[j].name || ("m" + j)) === parts[2]) return mask[j];
+                    }
+                    return null;
+                }
+                return maskNodeByPath(n, parts.slice(1));
+            }
+        }
+        return null;
+    }
+
+    for (var path in snap) {
+        if (!snap.hasOwnProperty(path)) continue;
+        var parts = path.split("|");
+        var node  = parts.indexOf("__mask__") !== -1
+                      ? maskNodeByPath(stack, parts)
+                      : nodeByPath(stack, parts);
+        if (node) {
+            try { alg.layers.setVisibility(node, snap[path]); } catch(e) {}
+        }
+    }
+    return true;
+})(TSNAME, SNAP)
+"""
+
+# ---------------------------------------------------------------------------
+#  JS: scan a layer's effects for the first one containing "invert"
+# ---------------------------------------------------------------------------
+_JS_SCAN_INVERT = """
+(function(tsName, layerPath) {
+    var stack = alg.texturesets.stack(tsName);
+    if (!stack) return JSON.stringify({found:false, index:-1, names:[]});
+    var parts = layerPath.split("|");
+    var cur   = stack;
+    for (var i = 0; i < parts.length; i++) {
+        var nodes = alg.layers.nodes(cur) || [];
+        var next  = null;
+        for (var j = 0; j < nodes.length; j++) {
+            if (nodes[j].name === parts[i]) { next = nodes[j]; break; }
+        }
+        if (!next) return JSON.stringify({found:false, index:-1, names:[]});
+        cur = next;
+    }
+    var efx   = [];
+    try { efx = alg.layers.effects(cur) || []; } catch(e) {}
+    var names = [];
+    var found = -1;
+    for (var k = 0; k < efx.length; k++) {
+        var nm = efx[k].name || ("effect_" + k);
+        names.push(nm);
+        if (found === -1 && nm.toLowerCase().indexOf("invert") !== -1) found = k;
+    }
+    return JSON.stringify({found: found !== -1, index: found, names: names});
+})(TSNAME, LAYERPATH)
+"""
+
+# ---------------------------------------------------------------------------
+#  JS: apply the full export state for one task in a single evaluate() call
+# ---------------------------------------------------------------------------
+_JS_APPLY_STATE = """
+(function(tsName, cfg) {
+    var stack = alg.texturesets.stack(tsName);
+    if (!stack) return "error:no_stack";
+
+    // Find node by "|"-delimited path from the stack root
+    function byPath(root, pathStr) {
+        if (!pathStr) return null;
+        var parts = pathStr.split("|");
+        var cur   = root;
+        for (var i = 0; i < parts.length; i++) {
+            var nodes = alg.layers.nodes(cur) || [];
+            var found = null;
+            for (var j = 0; j < nodes.length; j++) {
+                if (nodes[j].name === parts[i]) { found = nodes[j]; break; }
+            }
+            if (!found) return null;
+            cur = found;
+        }
+        return cur;
+    }
+
+    // Make one child visible inside a group; hide the rest; hide group if no child
+    function isolateChild(groupPath, childName) {
+        var group = byPath(stack, groupPath);
+        if (!group) return;
+        var show = (childName !== null && childName !== "");
+        alg.layers.setVisibility(group, show);
+        if (!show) return;
+        var kids = alg.layers.nodes(group) || [];
+        for (var i = 0; i < kids.length; i++) {
+            alg.layers.setVisibility(kids[i], kids[i].name === childName);
+        }
+    }
+
+    // Hide a group entirely
+    function hideGroup(groupPath) {
+        var g = byPath(stack, groupPath);
+        if (g) alg.layers.setVisibility(g, false);
+    }
+
+    // -- 1. Text fill layer --------------------------------------------------
+    if (cfg.textLayerPath) {
+        var textNode = byPath(stack, cfg.textLayerPath);
+        if (textNode) {
+            // Toggle invert filter
+            if (cfg.invertIdx >= 0) {
+                try {
+                    var efx = alg.layers.effects(textNode) || [];
+                    if (efx[cfg.invertIdx]) {
+                        alg.layers.setEffectEnabled(efx[cfg.invertIdx], cfg.invertOn);
+                    }
+                } catch(e) {}
+            }
+            // Toggle worn paint layer inside the black mask
+            if (cfg.wornPaintName) {
+                try {
+                    var mask = alg.layers.maskNodes(textNode) || [];
+                    for (var mi = 0; mi < mask.length; mi++) {
+                        if (mask[mi].name === cfg.wornPaintName) {
+                            alg.layers.setVisibility(mask[mi], cfg.wornPaintOn);
+                        }
+                    }
+                } catch(e) {}
+            }
+        }
+    }
+
+    // -- 2. Black Parts folder -----------------------------------------------
+    if (cfg.blackPartsPath) {
+        var bp = byPath(stack, cfg.blackPartsPath);
+        if (bp) {
+            alg.layers.setVisibility(bp, true);
+            var bpKids = alg.layers.nodes(bp) || [];
+            for (var bi = 0; bi < bpKids.length; bi++) {
+                var bname = bpKids[bi].name;
+                if (bname === cfg.blackWornName) {
+                    alg.layers.setVisibility(bpKids[bi], cfg.blackWornOn);
+                } else if (bname === cfg.blackName) {
+                    alg.layers.setVisibility(bpKids[bi], true);
+                }
+            }
+        }
+    }
+
+    // -- 3. Skin Pack folder -------------------------------------------------
+    if (cfg.skinPackPath) {
+        var sp = byPath(stack, cfg.skinPackPath);
+        if (sp) {
+            // Hide entire skin pack for default/default_worn (Black Parts carries those)
+            alg.layers.setVisibility(sp, !cfg.isDefault);
+
+            if (!cfg.isDefault) {
+                var normPath   = cfg.skinPackPath + "|" + cfg.normalFolderName;
+                var wPlasPath  = cfg.skinPackPath + "|" + cfg.wornPlasticName;
+                var wMetPath   = cfg.skinPackPath + "|" + cfg.wornMetalName;
+                var brightPath = cfg.skinPackPath + "|" + cfg.brightFolderName;
+
+                if (cfg.type === "normal") {
+                    isolateChild(normPath,   cfg.activeSkin);
+                    hideGroup(wPlasPath);
+                    hideGroup(wMetPath);
+                    hideGroup(brightPath);
+                } else if (cfg.type === "worn") {
+                    // Normal folder hidden entirely for worn exports
+                    hideGroup(normPath);
+                    // Both worn folders active at once (one child each)
+                    isolateChild(wPlasPath, cfg.wornPlasticSkin);
+                    isolateChild(wMetPath,  cfg.wornMetalSkin);
+                    hideGroup(brightPath);
+                } else if (cfg.type === "bright") {
+                    hideGroup(normPath);
+                    hideGroup(wPlasPath);
+                    hideGroup(wMetPath);
+                    isolateChild(brightPath, cfg.activeSkin);
+                }
+            }
+        }
+    }
+
+    return "ok";
+})(TSNAME, CFG)
+"""
+
+
+# =============================================================================
+#  PYTHON-SIDE HELPERS that wrap the JS calls
+# =============================================================================
+
+def _build_js(template: str, replacements: Dict[str, str]) -> str:
+    code = template
+    for key, val in replacements.items():
+        code = code.replace(key, val)
+    return code
+
+
+def _get_layer_tree(ts_name: str) -> List[Dict]:
+    raw = _js(_build_js(_JS_GET_TREE, {"TSNAME": json.dumps(ts_name)}))
+    if raw is None:
+        return []
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception as exc:
+        _log(f"Layer tree parse failed: {exc}", "error")
+        return []
+
+
+def _get_name_tree(ts_name: str) -> List[Dict]:
+    raw = _js(_build_js(_JS_NAME_TREE, {"TSNAME": json.dumps(ts_name)}))
+    if raw is None:
+        return []
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return []
+
+
+def _snapshot_visibility(ts_name: str) -> str:
+    raw = _js(_build_js(_JS_SNAPSHOT, {"TSNAME": json.dumps(ts_name)}))
+    if raw is None:
+        return "{}"
+    return raw if isinstance(raw, str) else json.dumps(raw)
+
+
+def _restore_visibility(ts_name: str, snap_json: str):
+    _js(_build_js(_JS_RESTORE, {
+        "TSNAME": json.dumps(ts_name),
+        "SNAP":   snap_json,
+    }))
+
+
+def _scan_for_invert(ts_name: str, layer_path: str) -> Dict:
+    raw = _js(_build_js(_JS_SCAN_INVERT, {
+        "TSNAME":    json.dumps(ts_name),
+        "LAYERPATH": json.dumps(layer_path),
+    }))
+    if raw is None:
+        return {"found": False, "index": -1, "names": []}
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return {"found": False, "index": -1, "names": []}
+
+
+def _apply_export_state(ts_name: str, cfg: Dict):
+    result = _js(_build_js(_JS_APPLY_STATE, {
+        "TSNAME": json.dumps(ts_name),
+        "CFG":    json.dumps(cfg),
+    }))
+    if result != "ok":
+        _log(f"apply_state returned: {result}", "warn")
+
+
+# =============================================================================
 #  NAME UTILITIES
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def clean_skin_name(raw: str) -> str:
-    """
-    Convert a raw SP layer name to a clean export filename (no extension).
-
-    Examples:
-        '!Skin Tan (Metal)'          → 'Tan'
-        '!Skin Tan Worn (Plastic)'   → 'Tan Worn'
-        '!Skin Black (Any Mat)'      → 'Default'
-        '!Skin Black Worn (Metal)'   → 'Default Worn'
-        '!Skin Gold (Any Mat)'       → 'Gold'
-        '!Skin Zenitco Desert (Any)' → 'Zenitco Desert'
-    """
     name = raw.strip()
-
-    # 1. Drop the "!Skin " prefix
     if name.startswith("!Skin "):
         name = name[6:]
-
-    # 2. Strip trailing (Any Mat) / (Metal) / (Plastic) / any parenthetical
     name = _RE_SUFFIX.sub("", name).strip()
-
-    # 3. Special rename: Black → Default  |  Black Worn → Default Worn
     lower = name.lower()
     if lower == "black":
         return "Default"
     if lower == "black worn":
         return "Default Worn"
-
     return name
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAYER API WRAPPERS
-#  These thin wrappers centralise all SP Python API calls so that if Autodesk
-#  changes a method name between SP releases, there is only ONE place to fix.
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _root_nodes(stack) -> List:
-    """Top-level layer nodes for a stack."""
-    try:
-        return sp_layers.get_root_layer_nodes(stack)
-    except Exception as exc:
-        _log(f"get_root_layer_nodes failed: {exc}", "error")
-        return []
-
-
-def _children(node) -> List:
-    """Direct children of a group node; empty list for non-groups."""
-    try:
-        if node.get_type() == sp_layers.NodeType.GroupLayer:
-            return node.get_nodes()
-    except Exception:
-        pass
-    return []
-
-
-def _find_child(nodes: List, name: str):
-    """Find the first direct-child node matching `name` (case-sensitive)."""
-    for n in nodes:
-        if n.get_name() == name:
-            return n
-    return None
-
-
-def _find_recursive(nodes: List, name: str):
-    """Find the first node matching `name` anywhere in the subtree."""
-    for n in nodes:
-        if n.get_name() == name:
-            return n
-        found = _find_recursive(_children(n), name)
+def _find_node(tree: List[Dict], name: str) -> Optional[Dict]:
+    for node in tree:
+        if node["name"] == name:
+            return node
+        found = _find_node(node.get("children", []), name)
         if found:
             return found
     return None
 
 
-def _set_visible(node, visible: bool):
-    """Toggle a layer's eye-icon (visibility)."""
-    try:
-        node.set_visible(visible)
-    except Exception as exc:
-        _log(f"Cannot set visibility on '{node.get_name()}': {exc}", "warn")
-
-
-def _is_visible(node) -> bool:
-    try:
-        return node.is_visible()
-    except Exception:
-        return True
-
-
-# ── Effect / filter helpers ───────────────────────────────────────────────────
-
-def _get_effects(node) -> List:
-    """
-    Return the filter/effect nodes attached to a layer (fill-layer effects).
-    SP 11 exposes these via node.get_effects().  We also try common fallbacks.
-    """
-    for attr in ("get_effects", "effects"):
-        try:
-            val = getattr(node, attr)
-            return val() if callable(val) else list(val)
-        except Exception:
-            pass
-    return []
-
-
-def _set_effect_enabled(node, index: int, enabled: bool) -> bool:
-    """Enable or disable the nth effect on a layer (0-indexed). Returns True on success."""
-    effects = _get_effects(node)
-    if not (0 <= index < len(effects)):
-        _log(
-            f"Effect index {index} out of range "
-            f"(layer '{node.get_name()}' has {len(effects)} effects)", "warn"
-        )
-        return False
-    try:
-        effects[index].set_enabled(enabled)
-        return True
-    except Exception as exc:
-        _log(f"Cannot toggle effect[{index}] on '{node.get_name()}': {exc}", "warn")
-        return False
-
-
-def _find_invert_effect_index(node) -> int:
-    """
-    Scan a fill layer's effects list and return the index of the first
-    effect whose name contains 'invert' (case-insensitive).
-    Returns -1 if not found.
-    """
-    for i, effect in enumerate(_get_effects(node)):
-        try:
-            if "invert" in effect.get_name().lower():
-                return i
-        except Exception:
-            pass
-    return -1
-
-
-# ── Mask helpers ──────────────────────────────────────────────────────────────
-
-def _mask_nodes(node) -> List:
-    """
-    Return the paint / fill layers that live inside a layer's black mask.
-    SP 11 exposes the mask via node.get_mask(); the mask itself is a NodeStack
-    whose children are retrieved with .get_nodes().
-    """
-    for attr in ("get_mask",):
-        try:
-            mask = getattr(node, attr)()
-            if mask:
-                return mask.get_nodes()
-        except Exception:
-            pass
-    # Fallback: try direct attribute
-    try:
-        return list(node.mask_nodes)
-    except Exception:
-        pass
-    return []
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  VISIBILITY SNAPSHOT  (save / restore full layer state)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _snapshot_visibility(nodes: List, out: Dict = None) -> Dict:
-    """
-    Recursively snapshot the visible state of every node in the subtree.
-    Returns a dict keyed by the node's Python id().
-    """
-    if out is None:
-        out = {}
+def _find_child(nodes: List[Dict], name: str) -> Optional[Dict]:
     for n in nodes:
-        out[id(n)] = (n, _is_visible(n))
-        _snapshot_visibility(_children(n), out)
-        _snapshot_visibility(_mask_nodes(n), out)
-    return out
+        if n["name"] == name:
+            return n
+    return None
 
 
-def _restore_visibility(snapshot: Dict):
-    """Restore every node to its snapshotted visibility."""
-    for node, was_visible in snapshot.values():
-        try:
-            node.set_visible(was_visible)
-        except Exception:
-            pass
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  LAYER PICKER DIALOG
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 class LayerPickerDialog(QtWidgets.QDialog):
-    """
-    Shows the layer tree for a given stack and lets the user click-select one
-    node. Groups are coloured differently; double-click or "Select" to confirm.
-    """
 
-    def __init__(self, stack, parent=None, title: str = "Select a Layer"):
+    def __init__(self, ts_name: str, parent=None, title: str = "Select a Layer"):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(340, 520)
-        self._stack = stack
+        self._ts_name        = ts_name
         self._selected_name: Optional[str] = None
 
         layout = QtWidgets.QVBoxLayout(self)
 
-        # Search bar
         self._search = QtWidgets.QLineEdit()
-        self._search.setPlaceholderText("Filter layers…")
+        self._search.setPlaceholderText("Filter layers...")
         self._search.textChanged.connect(self._filter_tree)
         layout.addWidget(self._search)
 
-        # Tree
         self._tree = QtWidgets.QTreeWidget()
         self._tree.setHeaderHidden(True)
         self._tree.itemDoubleClicked.connect(self._accept)
         layout.addWidget(self._tree)
 
-        # Buttons
-        btn_row = QtWidgets.QHBoxLayout()
-        ok_btn = QtWidgets.QPushButton("Select")
+        btn_row    = QtWidgets.QHBoxLayout()
+        ok_btn     = QtWidgets.QPushButton("Select")
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self._accept)
         cancel_btn = QtWidgets.QPushButton("Cancel")
@@ -335,41 +574,36 @@ class LayerPickerDialog(QtWidgets.QDialog):
 
     def _populate(self):
         self._tree.clear()
-        for node in _root_nodes(self._stack):
+        for node in _get_name_tree(self._ts_name):
             self._add_item(node, self._tree.invisibleRootItem())
         self._tree.expandAll()
 
-    def _add_item(self, node, parent_item):
-        name = node.get_name()
+    def _add_item(self, node: Dict, parent_item):
+        name = node["name"]
         item = QtWidgets.QTreeWidgetItem(parent_item, [name])
         item.setData(0, Qt.UserRole, name)
-        is_group = node.get_type() == sp_layers.NodeType.GroupLayer
+        is_group = bool(node.get("children")) or "group" in node.get("type", "").lower()
         if is_group:
             item.setForeground(0, QtGui.QColor("#e8a84e"))
             item.setFont(0, QtGui.QFont("", -1, QtGui.QFont.Bold))
-        for child in _children(node):
+        for child in node.get("children", []):
             self._add_item(child, item)
 
     def _filter_tree(self, text: str):
-        """Show/hide items matching the search text."""
         text = text.lower()
+
+        def _any_match(item) -> bool:
+            if text in item.text(0).lower():
+                return True
+            return any(_any_match(item.child(i)) for i in range(item.childCount()))
+
         def _apply(item):
-            label = item.text(0).lower()
-            match = not text or text in label
-            item.setHidden(not match and not _any_child_visible(item))
+            item.setHidden(not _any_match(item))
             for i in range(item.childCount()):
                 _apply(item.child(i))
-        def _any_child_visible(item):
-            for i in range(item.childCount()):
-                c = item.child(i)
-                if text in c.text(0).lower():
-                    return True
-                if _any_child_visible(c):
-                    return True
-            return False
-        root = self._tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            _apply(root.child(i))
+
+        for i in range(self._tree.invisibleRootItem().childCount()):
+            _apply(self._tree.invisibleRootItem().child(i))
 
     def _accept(self):
         item = self._tree.currentItem()
@@ -381,30 +615,26 @@ class LayerPickerDialog(QtWidgets.QDialog):
         return self._selected_name
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  MAIN EXPORTER WIDGET
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 class SkinExporterWidget(QtWidgets.QWidget):
-    """
-    The main dockable panel for the Skin Pack Exporter plugin.
-    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(PLUGIN_NAME)
         self._build_ui()
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     #  UI CONSTRUCTION
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _build_ui(self):
         root = QtWidgets.QVBoxLayout(self)
         root.setSpacing(6)
         root.setContentsMargins(8, 8, 8, 8)
 
-        # Title bar
         title_lbl = QtWidgets.QLabel(
             f'<b style="font-size:13px">{PLUGIN_NAME}</b>'
             f'<span style="color:#777; font-size:10px">  v{PLUGIN_VERSION}</span>'
@@ -412,176 +642,130 @@ class SkinExporterWidget(QtWidgets.QWidget):
         root.addWidget(title_lbl)
         root.addWidget(self._hline())
 
-        # ── TEXTURE SET ───────────────────────────────────────────────────────
+        # -- Texture Set -------------------------------------------------------
         ts_group = QtWidgets.QGroupBox("Texture Set")
         ts_lay   = QtWidgets.QHBoxLayout(ts_group)
         self._ts_combo = QtWidgets.QComboBox()
-        ts_refresh = QtWidgets.QPushButton("⟳")
-        ts_refresh.setFixedWidth(28)
-        ts_refresh.setToolTip("Refresh texture set list")
-        ts_refresh.clicked.connect(self._refresh_ts)
+        ts_ref = QtWidgets.QPushButton("Refresh")
+        ts_ref.setFixedWidth(56)
+        ts_ref.clicked.connect(self._refresh_ts)
         ts_lay.addWidget(self._ts_combo, 1)
-        ts_lay.addWidget(ts_refresh)
+        ts_lay.addWidget(ts_ref)
         root.addWidget(ts_group)
 
-        # ── LAYER ASSIGNMENTS ─────────────────────────────────────────────────
+        # -- Layer Assignments -------------------------------------------------
         la_group = QtWidgets.QGroupBox("Layer Assignments")
         la_form  = QtWidgets.QFormLayout(la_group)
         la_form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapAllRows)
-
-        self._skin_pack_edit = self._layer_picker_row(
-            la_form, "Skin Pack Folder:", DEFAULT_SKIN_PACK_NAME,
-            "Browse…",
-            tip="The !!Skin Pack (All) folder (or whatever name it has)"
-        )
-        self._text_layer_edit = self._layer_picker_row(
-            la_form, "Text Fill Layer:", DEFAULT_TEXT_LAYER,
-            "Browse…",
-            tip="The fill layer with the Invert filter and the black mask containing 'Worn'"
-        )
-        self._black_parts_edit = self._layer_picker_row(
-            la_form, "Black Parts Folder:", DEFAULT_BLACK_PARTS,
-            "Browse…",
-            tip="The folder holding the black + black worn layers"
-        )
+        self._skin_pack_edit   = self._picker_row(la_form, "Skin Pack Folder:",   DEFAULT_SKIN_PACK_NAME)
+        self._text_layer_edit  = self._picker_row(la_form, "Text Fill Layer:",    DEFAULT_TEXT_LAYER)
+        self._black_parts_edit = self._picker_row(la_form, "Black Parts Folder:", DEFAULT_BLACK_PARTS)
         root.addWidget(la_group)
 
-        # ── SKIN PACK SUB-FOLDERS ─────────────────────────────────────────────
+        # -- Sub-folder Names --------------------------------------------------
         sf_group = QtWidgets.QGroupBox("Skin Pack Sub-folder Names")
-        sf_group.setToolTip(
-            "Exact names of the four sub-folders inside the Skin Pack folder"
-        )
-        sf_form = QtWidgets.QFormLayout(sf_group)
+        sf_form  = QtWidgets.QFormLayout(sf_group)
         self._normal_edit    = self._text_row(sf_form, "Normal:",         DEFAULT_NORMAL_FOLDER)
         self._worn_plas_edit = self._text_row(sf_form, "Worn (Plastic):", DEFAULT_WORN_PLASTIC)
         self._worn_met_edit  = self._text_row(sf_form, "Worn (Metal):",   DEFAULT_WORN_METAL)
         self._bright_edit    = self._text_row(sf_form, "Bright:",         DEFAULT_BRIGHT_FOLDER)
         root.addWidget(sf_group)
 
-        # ── TEXT LAYER SETTINGS ───────────────────────────────────────────────
+        # -- Text Layer Settings -----------------------------------------------
         tl_group = QtWidgets.QGroupBox("Text Layer Settings")
         tl_form  = QtWidgets.QFormLayout(tl_group)
 
-        # Invert filter index
-        # Important: NOT auto-set to 0. Use Scan or type the index manually.
-        # -1 means "not configured yet" and will produce a warning on export.
         invert_row = QtWidgets.QHBoxLayout()
         self._invert_idx = QtWidgets.QSpinBox()
         self._invert_idx.setRange(-1, 30)
         self._invert_idx.setValue(-1)
         self._invert_idx.setSpecialValueText("\u26a0 Not set")
         self._invert_idx.setToolTip(
-            "0-based index of the Invert filter in the Text layer's effects list.\n"
-            "Click 'Scan' to auto-detect it, or type the index manually.\n"
-            "Leave at -1 / 'Not set' if there is no Text layer in use."
+            "0-based index of the Invert filter in the Text layer's effect list.\n"
+            "Use Scan to auto-detect, or type the index manually.\n"
+            "-1 = filter will not be toggled during export."
         )
         scan_btn = QtWidgets.QPushButton("Scan")
         scan_btn.setFixedWidth(48)
-        scan_btn.setToolTip(
-            "Scan the Text layer's effects list to auto-detect the Invert filter.\n"
-            "Fill in the Text layer name field first."
-        )
+        scan_btn.setToolTip("Scan the Text layer's effects and detect the Invert filter.")
         scan_btn.clicked.connect(self._scan_invert)
         invert_row.addWidget(self._invert_idx, 1)
         invert_row.addWidget(scan_btn)
         tl_form.addRow("Invert Filter Index:", invert_row)
 
-        # Worn paint layer name
         self._worn_paint_edit = QtWidgets.QLineEdit(DEFAULT_WORN_PAINT)
         self._worn_paint_edit.setToolTip(
-            "Name of the paint layer inside the Text layer's black mask\n"
-            "(the one you turn on to make text look worn)"
+            "Name of the paint layer inside the Text layer's black mask.\n"
+            "Turned ON for Worn and Default Worn exports."
         )
-        tl_form.addRow("'Worn' Paint Layer Name:", self._worn_paint_edit)
-
+        tl_form.addRow("Worn Paint Layer Name:", self._worn_paint_edit)
         root.addWidget(tl_group)
 
-        # ── EXPORT SETTINGS ───────────────────────────────────────────────────
+        # -- Export Settings ---------------------------------------------------
         ex_group = QtWidgets.QGroupBox("Export Settings")
         ex_form  = QtWidgets.QFormLayout(ex_group)
 
-        # Output folder
         folder_row = QtWidgets.QHBoxLayout()
         self._folder_edit = QtWidgets.QLineEdit()
-        self._folder_edit.setPlaceholderText("Choose export folder…")
-        browse_btn = QtWidgets.QPushButton("Browse…")
+        self._folder_edit.setPlaceholderText("Choose export folder...")
+        browse_btn = QtWidgets.QPushButton("Browse...")
         browse_btn.setFixedWidth(62)
         browse_btn.clicked.connect(self._browse_folder)
         folder_row.addWidget(self._folder_edit, 1)
         folder_row.addWidget(browse_btn)
         ex_form.addRow("Export Folder:", folder_row)
 
-        # Output template
         self._template_edit = QtWidgets.QLineEdit(DEFAULT_EXPORT_TEMPLATE)
-        self._template_edit.setToolTip(
-            "Name of your custom export preset in SP (e.g. 'Base Color')"
-        )
+        self._template_edit.setToolTip("Name of your custom export preset (e.g. 'Base Color').")
         ex_form.addRow("Output Preset:", self._template_edit)
 
-        # File format
         self._fmt_combo = QtWidgets.QComboBox()
         self._fmt_combo.addItems(["png", "tga", "tif", "jpeg", "exr"])
         ex_form.addRow("File Format:", self._fmt_combo)
 
-        # Restore state after export
         self._restore_check = QtWidgets.QCheckBox("Restore layer state after export")
         self._restore_check.setChecked(True)
-        self._restore_check.setToolTip(
-            "When checked, all layer visibility is restored to what it was\n"
-            "before the export run began."
-        )
         ex_form.addRow("", self._restore_check)
-
         root.addWidget(ex_group)
         root.addWidget(self._hline())
 
-        # ── ACTION BUTTONS ────────────────────────────────────────────────────
+        # -- Buttons -----------------------------------------------------------
         btn_row = QtWidgets.QHBoxLayout()
-
-        self._preview_btn = QtWidgets.QPushButton("👁  Preview")
-        self._preview_btn.setToolTip(
-            "Show the full list of files that will be exported without actually exporting"
-        )
+        self._preview_btn = QtWidgets.QPushButton("Preview")
         self._preview_btn.clicked.connect(self._preview)
-
-        self._export_btn = QtWidgets.QPushButton("▶  Export All")
+        self._export_btn  = QtWidgets.QPushButton("Export All")
         self._export_btn.setStyleSheet(
-            "QPushButton { background:#1e6b1e; color:white; font-weight:bold; padding:5px; }"
+            "QPushButton { background:#1e6b1e; color:white;"
+            " font-weight:bold; padding:5px; }"
             "QPushButton:disabled { background:#444; color:#888; }"
         )
         self._export_btn.clicked.connect(self._run_export)
-
         btn_row.addWidget(self._preview_btn, 1)
         btn_row.addWidget(self._export_btn, 2)
         root.addLayout(btn_row)
 
-        # ── LOG ───────────────────────────────────────────────────────────────
+        # -- Log ---------------------------------------------------------------
         log_group = QtWidgets.QGroupBox("Export Log")
         log_lay   = QtWidgets.QVBoxLayout(log_group)
-
         self._log_view = QtWidgets.QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setMinimumHeight(120)
         self._log_view.setFont(QtGui.QFont("Courier New", 8))
         log_lay.addWidget(self._log_view)
-
         clear_btn = QtWidgets.QPushButton("Clear Log")
         clear_btn.setFixedWidth(72)
         clear_btn.clicked.connect(self._log_view.clear)
         log_lay.addWidget(clear_btn, alignment=Qt.AlignRight)
-
         root.addWidget(log_group)
 
-        # Populate TS list on startup
         self._refresh_ts()
 
-    # ── UI helpers ────────────────────────────────────────────────────────────
+    # -- UI helpers -----------------------------------------------------------
 
-    def _layer_picker_row(self, form, label, default, btn_label, tip=""):
-        row = QtWidgets.QHBoxLayout()
+    def _picker_row(self, form, label, default):
+        row  = QtWidgets.QHBoxLayout()
         edit = QtWidgets.QLineEdit(default)
-        edit.setToolTip(tip)
-        btn = QtWidgets.QPushButton(btn_label)
+        btn  = QtWidgets.QPushButton("Browse...")
         btn.setFixedWidth(62)
         btn.clicked.connect(lambda _, e=edit: self._pick_layer(e))
         row.addWidget(edit, 1)
@@ -600,7 +784,7 @@ class SkinExporterWidget(QtWidgets.QWidget):
         line.setFrameShadow(QtWidgets.QFrame.Sunken)
         return line
 
-    # ── UI actions ────────────────────────────────────────────────────────────
+    # -- UI actions -----------------------------------------------------------
 
     def _refresh_ts(self):
         self._ts_combo.clear()
@@ -618,203 +802,144 @@ class SkinExporterWidget(QtWidgets.QWidget):
             self._folder_edit.setText(folder)
 
     def _pick_layer(self, target_edit: QtWidgets.QLineEdit):
-        if not sp_project.is_open():
-            QtWidgets.QMessageBox.warning(self, "No Project", "No project is currently open.")
+        ts = self._ts_name()
+        if not ts:
+            QtWidgets.QMessageBox.warning(self, "No Texture Set",
+                "Select a texture set first.")
             return
-        stack = self._get_stack()
-        if stack is None:
-            return
-        dlg = LayerPickerDialog(stack, parent=self, title="Select Layer or Folder")
+        dlg = LayerPickerDialog(ts, parent=self, title="Select Layer / Folder")
         if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.selected_name():
             target_edit.setText(dlg.selected_name())
 
     def _scan_invert(self):
-        """Auto-detect the Invert filter on the Text fill layer."""
-        stack = self._get_stack()
-        if stack is None:
+        ts = self._ts_name()
+        if not ts:
             return
-        roots = _root_nodes(stack)
         text_name = self._text_layer_edit.text().strip()
-        text_node  = _find_recursive(roots, text_name)
-        if text_node is None:
-            self._ulog(f"Text layer '{text_name}' not found. Check the name.")
+        if not text_name:
+            self._ulog("Fill in the Text Layer name before scanning.")
             return
-        idx = _find_invert_effect_index(text_node)
-        if idx == -1:
-            effects = _get_effects(text_node)
-            names   = [e.get_name() for e in effects]
+        result = _scan_for_invert(ts, text_name)
+        if result["found"]:
+            self._invert_idx.setValue(result["index"])
+            self._ulog(f"Invert filter found at index {result['index']} on '{text_name}'.")
+        else:
             self._ulog(
                 f"No 'Invert' effect found on '{text_name}'.\n"
-                f"Effects found: {names if names else '(none)'}\n"
-                f"Set the index manually."
+                f"Effects present: {result['names'] or '(none)'}\n"
+                f"Set the index manually if the effect has a different name."
             )
-        else:
-            self._invert_idx.setValue(idx)
-            self._ulog(f"Invert filter found at index {idx} on '{text_name}'.")
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  STACK / TS HELPERS
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
-    def _get_ts_name(self) -> Optional[str]:
+    def _ts_name(self) -> Optional[str]:
         name = self._ts_combo.currentText()
-        if not name or name == "(no project open)":
-            return None
-        return name
-
-    def _get_stack(self):
-        ts_name = self._get_ts_name()
-        if ts_name is None:
-            return None
-        for ts in sp_textureset.all_texture_sets():
-            if ts.name() == ts_name:
-                try:
-                    return ts.get_stack()
-                except Exception as exc:
-                    self._ulog(f"Error getting stack for '{ts_name}': {exc}")
-                    return None
-        return None
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  LOGGING (in-plugin)
-    # ──────────────────────────────────────────────────────────────────────────
+        return None if (not name or name == "(no project open)") else name
 
     def _ulog(self, msg: str, level: str = "info"):
         self._log_view.appendPlainText(msg)
         _log(msg, level)
         QtWidgets.QApplication.processEvents()
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     #  EXPORT PLAN BUILDER
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _build_plan(self):
-        """
-        Analyse the current layer stack and return a list of export task dicts.
+        ts = self._ts_name()
+        if not ts:
+            return None, "No texture set selected."
 
-        Each task dict contains:
-          filename         str   — clean output name (no extension)
-          type             str   — 'normal'|'worn'|'bright'|'default'|'default_worn'
-          normal_layer     str|None
-          worn_plas_layer  str|None
-          worn_met_layer   str|None
-          bright_layer     str|None
+        tree = _get_layer_tree(ts)
+        if not tree:
+            return None, "Could not retrieve layer tree. Is a project open?"
 
-        Returns (tasks, error_string).  error_string is None on success.
-        """
-        stack = self._get_stack()
-        if stack is None:
-            return None, "Could not get texture set stack. Is a project open?"
+        sp_name     = self._skin_pack_edit.text().strip()
+        bp_name     = self._black_parts_edit.text().strip()
+        norm_name   = self._normal_edit.text().strip()
+        wp_name     = self._worn_plas_edit.text().strip()
+        wm_name     = self._worn_met_edit.text().strip()
+        bright_name = self._bright_edit.text().strip()
 
-        roots = _root_nodes(stack)
-
-        # ── Resolve Skin Pack folder
-        sp_name   = self._skin_pack_edit.text().strip()
-        skin_pack = _find_recursive(roots, sp_name)
+        skin_pack = _find_node(tree, sp_name)
         if skin_pack is None:
-            return None, f"Skin Pack folder not found: '{sp_name}'"
+            return None, f"Skin Pack folder '{sp_name}' not found."
 
-        sp_kids = _children(skin_pack)
-
-        # ── Resolve sub-folders (missing folders are silently skipped)
-        def _sub(name): return _find_child(sp_kids, name.strip())
-
-        normal_folder    = _sub(self._normal_edit.text())
-        worn_plas_folder = _sub(self._worn_plas_edit.text())
-        worn_met_folder  = _sub(self._worn_met_edit.text())
-        bright_folder    = _sub(self._bright_edit.text())
+        sp_kids = skin_pack.get("children", [])
+        normal_folder    = _find_child(sp_kids, norm_name)
+        worn_plas_folder = _find_child(sp_kids, wp_name)
+        worn_met_folder  = _find_child(sp_kids, wm_name)
+        bright_folder    = _find_child(sp_kids, bright_name)
 
         tasks: List[Dict[str, Any]] = []
 
-        # ── Normal skins ──────────────────────────────────────────────────────
+        # Normal
         if normal_folder:
-            for node in _children(normal_folder):
-                clean = clean_skin_name(node.get_name())
+            for child in normal_folder.get("children", []):
+                clean = clean_skin_name(child["name"])
                 if clean in ("Default", "Default Worn"):
-                    continue  # handled by Black Parts
+                    continue
                 tasks.append({
-                    "filename":        clean,
-                    "type":            "normal",
-                    "normal_layer":    node.get_name(),
-                    "worn_plas_layer": None,
-                    "worn_met_layer":  None,
-                    "bright_layer":    None,
+                    "filename":       clean,
+                    "type":           "normal",
+                    "activeSkin":     child["name"],
+                    "wornPlasticSkin": None,
+                    "wornMetalSkin":  None,
                 })
 
-        # ── Worn skins (pair Plastic + Metal by clean name) ───────────────────
+        # Worn (pair by clean name)
         if worn_plas_folder or worn_met_folder:
             plas_map: Dict[str, str] = {}
             met_map:  Dict[str, str] = {}
-
             if worn_plas_folder:
-                for node in _children(worn_plas_folder):
-                    plas_map[clean_skin_name(node.get_name())] = node.get_name()
+                for c in worn_plas_folder.get("children", []):
+                    plas_map[clean_skin_name(c["name"])] = c["name"]
             if worn_met_folder:
-                for node in _children(worn_met_folder):
-                    met_map[clean_skin_name(node.get_name())] = node.get_name()
-
-            # Merge by clean name; skip Default / Default Worn (Black Parts handles those)
+                for c in worn_met_folder.get("children", []):
+                    met_map[clean_skin_name(c["name"])] = c["name"]
             for clean in sorted(set(plas_map) | set(met_map)):
                 if clean in ("Default", "Default Worn"):
                     continue
                 tasks.append({
-                    "filename":        clean,
-                    "type":            "worn",
-                    "normal_layer":    None,
-                    "worn_plas_layer": plas_map.get(clean),   # None if no plastic version
-                    "worn_met_layer":  met_map.get(clean),    # None if no metal version
-                    "bright_layer":    None,
+                    "filename":       clean,
+                    "type":           "worn",
+                    "activeSkin":     None,
+                    "wornPlasticSkin": plas_map.get(clean),
+                    "wornMetalSkin":  met_map.get(clean),
                 })
 
-        # ── Bright skins ──────────────────────────────────────────────────────
+        # Bright
         if bright_folder:
-            for node in _children(bright_folder):
+            for child in bright_folder.get("children", []):
                 tasks.append({
-                    "filename":        clean_skin_name(node.get_name()),
-                    "type":            "bright",
-                    "normal_layer":    None,
-                    "worn_plas_layer": None,
-                    "worn_met_layer":  None,
-                    "bright_layer":    node.get_name(),
+                    "filename":       clean_skin_name(child["name"]),
+                    "type":           "bright",
+                    "activeSkin":     child["name"],
+                    "wornPlasticSkin": None,
+                    "wornMetalSkin":  None,
                 })
 
-        # ── Black Parts (Default + Default Worn) ──────────────────────────────
-        bp_name     = self._black_parts_edit.text().strip()
-        black_parts = _find_recursive(roots, bp_name)
+        # Black Parts
+        black_parts = _find_node(tree, bp_name)
         if black_parts:
-            black_raw = None
-            b_worn_raw = None
-            for child in _children(black_parts):
-                cn = clean_skin_name(child.get_name())
-                if cn == "Default" and black_raw is None:
-                    black_raw = child.get_name()
-                elif cn == "Default Worn" and b_worn_raw is None:
-                    b_worn_raw = child.get_name()
-
-            if black_raw:
-                tasks.append({
-                    "filename":        "Default",
-                    "type":            "default",
-                    "normal_layer":    None,
-                    "worn_plas_layer": None,
-                    "worn_met_layer":  None,
-                    "bright_layer":    None,
-                })
-            if b_worn_raw:
-                tasks.append({
-                    "filename":        "Default Worn",
-                    "type":            "default_worn",
-                    "normal_layer":    None,
-                    "worn_plas_layer": None,
-                    "worn_met_layer":  None,
-                    "bright_layer":    None,
-                })
+            black_name = None
+            bworn_name = None
+            for child in black_parts.get("children", []):
+                cn = clean_skin_name(child["name"])
+                if cn == "Default"      and black_name is None: black_name = child["name"]
+                if cn == "Default Worn" and bworn_name is None: bworn_name = child["name"]
+            if black_name:
+                tasks.append({"filename": "Default",      "type": "default",
+                               "activeSkin": None, "wornPlasticSkin": None, "wornMetalSkin": None})
+            if bworn_name:
+                tasks.append({"filename": "Default Worn", "type": "default_worn",
+                               "activeSkin": None, "wornPlasticSkin": None, "wornMetalSkin": None})
 
         return tasks, None
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     #  PREVIEW
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _preview(self):
         self._log_view.clear()
@@ -825,126 +950,98 @@ class SkinExporterWidget(QtWidgets.QWidget):
         if err:
             self._ulog(f"ERROR: {err}")
             return
-
-        self._ulog(f"Export plan — {len(tasks)} file(s):\n")
-        fmt = self._fmt_combo.currentText()
+        fmt   = self._fmt_combo.currentText()
         col_w = max((len(t["filename"]) for t in tasks), default=0) + 2
+        self._ulog(f"Export plan -- {len(tasks)} file(s):\n")
         for i, t in enumerate(tasks, 1):
-            name_padded = t["filename"].ljust(col_w)
             notes = []
-            if t["worn_plas_layer"] and t["worn_met_layer"]:
-                notes.append("plastic+metal")
-            elif t["worn_plas_layer"]:
-                notes.append("plastic only")
-            elif t["worn_met_layer"]:
-                notes.append("metal only")
+            if t["wornPlasticSkin"] and t["wornMetalSkin"]: notes.append("plastic+metal")
+            elif t["wornPlasticSkin"]:                       notes.append("plastic only")
+            elif t["wornMetalSkin"]:                         notes.append("metal only")
             note = f"  ({', '.join(notes)})" if notes else ""
             self._ulog(
-                f"  {i:>3}.  [{t['type']:<12}]  {name_padded}.{fmt}{note}"
+                f"  {i:>3}.  [{t['type']:<12}]  "
+                f"{t['filename'].ljust(col_w)}.{fmt}{note}"
             )
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     #  MAIN EXPORT RUNNER
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
     def _run_export(self):
         if not sp_project.is_open():
             QtWidgets.QMessageBox.warning(self, "No Project", "No project is currently open.")
             return
-
         export_dir = self._folder_edit.text().strip()
         if not export_dir:
             QtWidgets.QMessageBox.warning(self, "No Folder", "Please select an export folder.")
             return
+
+        # Pre-export warnings
+        warns = []
+        if self._invert_idx.value() < 0:
+            warns.append(
+                "Invert Filter Index is not set -- the Invert filter will NOT be toggled "
+                "(Bright vs Normal/Worn distinction will be missing). Use Scan to fix this."
+            )
+        if not self._text_layer_edit.text().strip():
+            warns.append("Text Fill Layer name is empty -- text effects will be skipped.")
+        if not self._black_parts_edit.text().strip():
+            warns.append("Black Parts Folder name is empty -- Default/Default Worn will be skipped.")
+        if warns:
+            msg   = "\n\n".join(f"  * {w}" for w in warns)
+            reply = QtWidgets.QMessageBox.warning(
+                self, "Export Warnings", f"Proceed anyway?\n\n{msg}",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
 
         tasks, err = self._build_plan()
         if err:
             QtWidgets.QMessageBox.critical(self, "Plan Error", err)
             return
         if not tasks:
-            QtWidgets.QMessageBox.information(self, "Nothing to Export", "No exportable skins found.")
+            QtWidgets.QMessageBox.information(self, "Nothing to Export",
+                "No exportable skins found.")
             return
 
         os.makedirs(export_dir, exist_ok=True)
 
-        # ── Pre-export validation warnings ───────────────────────────────────
-        warnings = []
-        if self._invert_idx.value() < 0:
-            warnings.append(
-                "Invert Filter Index is not set. The Invert filter state will NOT be "
-                "toggled during export (Bright vs Normal/Worn). Set it via Scan first."
-            )
-        if not self._text_layer_edit.text().strip():
-            warnings.append("Text Fill Layer name is empty — text effects will be skipped.")
-        if not self._black_parts_edit.text().strip():
-            warnings.append("Black Parts Folder name is empty — Default/Default Worn will be skipped.")
-        if warnings:
-            msg = "\n\n".join(f"• {w}" for w in warnings)
-            reply = QtWidgets.QMessageBox.warning(
-                self, "Export Warnings",
-                f"Proceed anyway?\n\n{msg}",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel
-            )
-            if reply != QtWidgets.QMessageBox.Yes:
-                return
+        ts_name    = self._ts_name()
+        file_fmt   = self._fmt_combo.currentText()
+        template   = self._template_edit.text().strip()
+        sp_name    = self._skin_pack_edit.text().strip()
+        bp_name    = self._black_parts_edit.text().strip()
+        text_name  = self._text_layer_edit.text().strip()
+        invert_idx = self._invert_idx.value()
+        worn_paint = self._worn_paint_edit.text().strip()
 
-        # Collect all references we need during the export loop
-        stack  = self._get_stack()
-        roots  = _root_nodes(stack)
-        ts_name = self._get_ts_name()
+        # Resolve Black Parts children names for the JS cfg
+        tree        = _get_layer_tree(ts_name)
+        black_parts = _find_node(tree, bp_name)
+        black_name  = None
+        bworn_name  = None
+        if black_parts:
+            for child in black_parts.get("children", []):
+                cn = clean_skin_name(child["name"])
+                if cn == "Default"      and black_name is None: black_name = child["name"]
+                if cn == "Default Worn" and bworn_name is None: bworn_name = child["name"]
 
-        sp_name     = self._skin_pack_edit.text().strip()
-        bp_name     = self._black_parts_edit.text().strip()
-        text_name   = self._text_layer_edit.text().strip()
+        # Snapshot
+        snap_json = ""
+        if self._restore_check.isChecked():
+            self._ulog("Snapshotting layer state...")
+            snap_json = _snapshot_visibility(ts_name)
 
-        skin_pack   = _find_recursive(roots, sp_name)
-        black_parts = _find_recursive(roots, bp_name)
-        text_layer  = _find_recursive(roots, text_name)
-
-        sp_kids          = _children(skin_pack) if skin_pack else []
-        normal_folder    = _find_child(sp_kids, self._normal_edit.text().strip())
-        worn_plas_folder = _find_child(sp_kids, self._worn_plas_edit.text().strip())
-        worn_met_folder  = _find_child(sp_kids, self._worn_met_edit.text().strip())
-        bright_folder    = _find_child(sp_kids, self._bright_edit.text().strip())
-
-        # Black Parts children
-        bp_kids     = _children(black_parts) if black_parts else []
-        black_node  = None
-        bworn_node  = None
-        for child in bp_kids:
-            cn = clean_skin_name(child.get_name())
-            if cn == "Default"      and black_node  is None: black_node  = child
-            if cn == "Default Worn" and bworn_node  is None: bworn_node  = child
-
-        # Worn paint layer inside Text's mask
-        worn_paint_node = None
-        if text_layer:
-            worn_paint_node = _find_child(
-                _mask_nodes(text_layer),
-                self._worn_paint_edit.text().strip()
-            )
-
-        invert_idx   = self._invert_idx.value()
-        file_fmt     = self._fmt_combo.currentText()
-        template     = self._template_edit.text().strip()
-        should_restore = self._restore_check.isChecked()
-
-        # ── Snapshot visibility BEFORE we start ─────────────────────────────
-        snapshot: Dict = {}
-        if should_restore:
-            snapshot = _snapshot_visibility(roots)
-
-        # ── Export loop ──────────────────────────────────────────────────────
         self._log_view.clear()
         self._export_btn.setEnabled(False)
         self._ulog(f"Starting export of {len(tasks)} texture(s) to:\n  {export_dir}\n")
 
-        ok_count   = 0
-        fail_count = 0
+        ok_count = fail_count = 0
 
-        # Build a progress dialog
         progress = QtWidgets.QProgressDialog(
-            "Exporting textures…", "Cancel", 0, len(tasks), self
+            "Exporting...", "Cancel", 0, len(tasks), self
         )
         progress.setWindowTitle(PLUGIN_NAME)
         progress.setWindowModality(Qt.WindowModal)
@@ -952,185 +1049,94 @@ class SkinExporterWidget(QtWidgets.QWidget):
 
         for i, task in enumerate(tasks):
             if progress.wasCanceled():
-                self._ulog("\n⚠  Export cancelled by user.")
+                self._ulog("\nExport cancelled by user.")
                 break
 
             progress.setValue(i)
-            progress.setLabelText(f"Exporting {task['filename']}.{file_fmt}  ({i+1}/{len(tasks)})")
-
+            progress.setLabelText(
+                f"Exporting {task['filename']}.{file_fmt}  ({i+1}/{len(tasks)})"
+            )
             self._ulog(f"[{i+1}/{len(tasks)}] {task['filename']}.{file_fmt}  ({task['type']})")
 
             try:
-                self._apply_state(
-                    task,
-                    skin_pack, normal_folder,
-                    worn_plas_folder, worn_met_folder, bright_folder,
-                    black_parts, black_node, bworn_node,
-                    text_layer, invert_idx, worn_paint_node
-                )
+                ttype      = task["type"]
+                is_worn    = ttype in ("worn", "default_worn")
+                is_default = ttype in ("default", "default_worn")
 
-                exported = self._do_export(ts_name, template, file_fmt, export_dir, task["filename"])
+                cfg = {
+                    "type":             ttype,
+                    "isDefault":        is_default,
+                    "invertOn":         ttype != "bright",
+                    "invertIdx":        invert_idx,
+                    "wornPaintOn":      is_worn,
+                    "blackWornOn":      is_worn,
+                    "textLayerPath":    text_name,
+                    "wornPaintName":    worn_paint,
+                    "skinPackPath":     sp_name,
+                    "blackPartsPath":   bp_name,
+                    "blackName":        black_name or "",
+                    "blackWornName":    bworn_name or "",
+                    "normalFolderName": self._normal_edit.text().strip(),
+                    "wornPlasticName":  self._worn_plas_edit.text().strip(),
+                    "wornMetalName":    self._worn_met_edit.text().strip(),
+                    "brightFolderName": self._bright_edit.text().strip(),
+                    "activeSkin":       task.get("activeSkin") or "",
+                    "wornPlasticSkin":  task.get("wornPlasticSkin") or "",
+                    "wornMetalSkin":    task.get("wornMetalSkin") or "",
+                }
+
+                _apply_export_state(ts_name, cfg)
+                exported = self._do_export(ts_name, template, file_fmt,
+                                           export_dir, task["filename"])
                 if exported:
                     ok_count += 1
-                    self._ulog(f"  ✓ OK")
+                    self._ulog("  OK")
                 else:
                     fail_count += 1
-                    self._ulog(f"  ✗ Export returned no result")
+                    self._ulog("  Export returned no result -- check SP's log panel.")
 
             except Exception:
                 fail_count += 1
-                err_msg = traceback.format_exc()
-                self._ulog(f"  ✗ Exception:\n{err_msg}", "error")
+                self._ulog(f"  Exception:\n{traceback.format_exc()}", "error")
 
         progress.setValue(len(tasks))
 
-        # ── Restore visibility ────────────────────────────────────────────────
-        if should_restore and snapshot:
-            _restore_visibility(snapshot)
+        if self._restore_check.isChecked() and snap_json:
+            _restore_visibility(ts_name, snap_json)
             self._ulog("\nLayer state restored to original.")
 
         self._ulog(f"\n{'='*40}")
-        self._ulog(f"Done — {ok_count} succeeded, {fail_count} failed.")
+        self._ulog(f"Done -- {ok_count} succeeded, {fail_count} failed.")
         self._export_btn.setEnabled(True)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    #  LAYER STATE APPLICATION
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _apply_state(
-        self,
-        task: Dict,
-        skin_pack, normal_folder, worn_plas_folder, worn_met_folder, bright_folder,
-        black_parts, black_node, bworn_node,
-        text_layer, invert_idx: int, worn_paint_node
-    ):
-        """
-        Set the correct visibility / filter state for this export task.
-
-        ┌──────────────┬──────────────┬───────────┬─────────────┬───────────────┐
-        │ Type         │ Invert Filter│ Worn Paint│ Black Worn  │ Active folder │
-        ├──────────────┼──────────────┼───────────┼─────────────┼───────────────┤
-        │ normal       │ ON           │ OFF       │ OFF         │ Normal        │
-        │ worn         │ ON           │ ON        │ ON          │ Worn(P+M)     │
-        │ bright       │ OFF          │ OFF       │ OFF         │ Bright        │
-        │ default      │ ON           │ OFF       │ OFF         │ (none)        │
-        │ default_worn │ ON           │ ON        │ ON          │ (none)        │
-        └──────────────┴──────────────┴───────────┴─────────────┴───────────────┘
-        """
-        ttype = task["type"]
-        is_worn = ttype in ("worn", "default_worn")
-        is_default = ttype in ("default", "default_worn")
-
-        # 1. Text layer: invert filter + worn paint layer
-        if text_layer:
-            # Guard: -1 means the user hasn't configured the index yet
-            if invert_idx >= 0:
-                _set_effect_enabled(text_layer, invert_idx, ttype != "bright")
-            else:
-                _log(
-                    "Invert Filter Index is set to 'Not set' (-1). "
-                    "The Invert filter was NOT toggled for this export. "
-                    "Use the Scan button or type the index manually.",
-                    "warn"
-                )
-            if worn_paint_node:
-                _set_visible(worn_paint_node, is_worn)
-
-        # 2. Black Parts: always visible; toggle Black Worn sub-layer
-        if black_parts:
-            _set_visible(black_parts, True)
-            if black_node:
-                _set_visible(black_node, True)
-            if bworn_node:
-                _set_visible(bworn_node, is_worn)
-
-        # 3. Skin Pack folder
-        if skin_pack:
-            # Hide the whole folder for Default/Default Worn (Black Parts carries it)
-            _set_visible(skin_pack, not is_default)
-
-            if not is_default:
-                # Helper: set one sub-folder's visibility and isolate one child
-                def _activate_folder(folder, active_child_name):
-                    if folder is None:
-                        return
-                    show = (active_child_name is not None)
-                    _set_visible(folder, show)
-                    if show:
-                        for child in _children(folder):
-                            _set_visible(child, child.get_name() == active_child_name)
-
-                if ttype == "normal":
-                    _activate_folder(normal_folder,    task["normal_layer"])
-                    _activate_folder(worn_plas_folder, None)
-                    _activate_folder(worn_met_folder,  None)
-                    _activate_folder(bright_folder,    None)
-
-                elif ttype == "worn":
-                    # Normal folder is hidden entirely for worn exports (per user preference)
-                    # Both Worn (Plastic) and Worn (Metal) folders may be active simultaneously
-                    _activate_folder(normal_folder,    None)
-                    _activate_folder(worn_plas_folder, task["worn_plas_layer"])
-                    _activate_folder(worn_met_folder,  task["worn_met_layer"])
-                    _activate_folder(bright_folder,    None)
-
-                elif ttype == "bright":
-                    _activate_folder(normal_folder,    None)
-                    _activate_folder(worn_plas_folder, None)
-                    _activate_folder(worn_met_folder,  None)
-                    _activate_folder(bright_folder,    task["bright_layer"])
-
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
     #  SP EXPORT CALL
-    # ──────────────────────────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
 
-    def _do_export(
-        self,
-        ts_name:    str,
-        template:   str,
-        file_fmt:   str,
-        export_dir: str,
-        filename:   str,
-    ) -> bool:
-        """
-        Call substance_painter.export.export_project_textures for the current
-        layer visibility state, writing the result to export_dir/filename.file_fmt.
-
-        SP may append the preset name to the filename (e.g. Tan_Base Color.png).
-        We attempt to auto-rename any such output to the clean name.
-        """
+    def _do_export(self, ts_name, template, file_fmt, export_dir, filename) -> bool:
         config = {
             "exportPath":          export_dir,
             "defaultExportPreset": template,
-            "exportList": [
-                {"rootPath": ts_name}
-            ],
-            "exportParameters": [
-                {
-                    "rootPath": ts_name,
-                    "filter":   {},
-                    "parameters": {
-                        "fileFormat":        file_fmt,
-                        "bitDepth":          "8",
-                        "dithering":         True,
-                        "paddingAlgorithm":  "infinite",
-                        "dilationDistance":  16,
-                        # fileName: SP uses this as the base name.
-                        # Tokens like $TextureSet are supported but we pass
-                        # a literal string so output becomes filename.ext
-                        "fileName":          filename,
-                    }
+            "exportList":          [{"rootPath": ts_name}],
+            "exportParameters": [{
+                "rootPath": ts_name,
+                "filter":   {},
+                "parameters": {
+                    "fileFormat":       file_fmt,
+                    "bitDepth":         "8",
+                    "dithering":        True,
+                    "paddingAlgorithm": "infinite",
+                    "dilationDistance": 16,
+                    "fileName":         filename,
                 }
-            ]
+            }]
         }
 
         result = sp_export.export_project_textures(config)
 
-        # ── Post-export rename guard ──────────────────────────────────────────
-        # If SP appended the preset name (e.g. "Tan_Base Color.png") rename it
+        # Auto-rename if SP appended the preset name (e.g. "Tan_Base Color.png")
         expected = os.path.join(export_dir, f"{filename}.{file_fmt}")
         if not os.path.exists(expected):
-            # Look for pattern: filename_*.ext  or  filename *.ext
             for pattern in (
                 os.path.join(export_dir, f"{filename}_*.{file_fmt}"),
                 os.path.join(export_dir, f"{filename} *.{file_fmt}"),
@@ -1138,41 +1144,30 @@ class SkinExporterWidget(QtWidgets.QWidget):
                 matches = glob.glob(pattern)
                 if len(matches) == 1:
                     os.rename(matches[0], expected)
-                    _log(f"  Renamed '{os.path.basename(matches[0])}' → '{filename}.{file_fmt}'")
-                    break
-                elif len(matches) > 1:
-                    # Multiple maps — keep SP's naming (user's preset exports >1 map)
-                    _log(f"  Multiple maps exported: {[os.path.basename(m) for m in matches]}")
+                    _log(f"  Renamed '{os.path.basename(matches[0])}' -> '{filename}.{file_fmt}'")
                     break
 
         return result is not None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 #  PLUGIN ENTRY POINTS
-#  SP calls start_plugin() when it loads the file and close_plugin() on unload.
-# ═══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 _dock_widget: Optional[QtWidgets.QDockWidget] = None
 
 
 def start_plugin():
     global _dock_widget
-
-    # Wrap the widget in a scroll area so it works at any panel size
     scroll = QtWidgets.QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setWidget(SkinExporterWidget())
-
     _dock_widget = QtWidgets.QDockWidget(PLUGIN_NAME)
     _dock_widget.setObjectName("SkinPackExporterDock")
-    _dock_widget.setAllowedAreas(
-        Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea
-    )
+    _dock_widget.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
     _dock_widget.setWidget(scroll)
-
     sp_ui.add_dock_widget(_dock_widget)
-    _log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} loaded successfully.")
+    _log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} loaded.")
 
 
 def close_plugin():
@@ -1183,6 +1178,5 @@ def close_plugin():
     _log(f"{PLUGIN_NAME} unloaded.")
 
 
-# Allow running standalone for quick syntax checks (SP not available outside)
 if __name__ == "__main__":
-    print("Run this file as a Substance Painter plugin, not standalone.")
+    print("Run this as a Substance Painter plugin, not standalone.")
