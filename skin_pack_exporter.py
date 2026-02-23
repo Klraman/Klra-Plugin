@@ -1,5 +1,5 @@
 """
-Skin Pack Exporter -- Substance Painter Plugin v1.3.0
+Skin Pack Exporter -- Substance Painter Plugin v1.3.1
 Compatible with SP 11.1.2+
 
 INSTALLATION:
@@ -210,8 +210,32 @@ def _get_selected_layer(ts_name: str) -> str:
     stack = _get_ts_stack(ts_name)
     if not stack: return None
     try:
-        sel = sp_layerstack.get_selected_nodes(stack)
-        if sel: return get_node_name(sel[0])
+        # 1. Get the selected Layer UIDs (integers)
+        selection = sp_layerstack.get_selected_nodes(stack)
+        if not selection: return None
+        
+        # If selection gives us objects, use them; if ints, we must search.
+        # SP 11+ often returns list of ints.
+        target_uid = selection[0]
+        if hasattr(target_uid, 'uid'):
+            return get_node_name(target_uid) # It was an object
+            
+        # 2. It's a number (UID), so we must traverse the stack to find the name
+        def find_name_by_uid(nodes, uid):
+            for n in nodes:
+                if n.uid() == uid:
+                    return get_node_name(n)
+                # Check children (Group layers)
+                if hasattr(n, 'sub_layers'):
+                    found = find_name_by_uid(n.sub_layers(), uid)
+                    if found: return found
+            return None
+
+        # Start search from root
+        root_nodes = sp_layerstack.get_root_layer_nodes(stack)
+        name = find_name_by_uid(root_nodes, target_uid)
+        return name if name else f"<Unknown UID {target_uid}>"
+
     except Exception as e:
         sp_log.error(f"Get selected error: {e}")
     return None
@@ -997,16 +1021,16 @@ _action: Optional[Any] = None   # QAction in SP's Python menu
 def start_plugin():
     global _dialog, _action
 
-    # Register a menu action so the user can re-open the window at any time
-    _action = QAction(PLUGIN_NAME, sp_ui.get_main_window())
+    # Create the action
+    _action = QAction("Open Skin Pack Exporter", sp_ui.get_main_window())
     _action.triggered.connect(_show_window)
     
-    # Place the action in the Window menu instead of using a string path
+    # Add it to the 'Window' menu so it persists even if you close the panel
     sp_ui.add_action(sp_ui.ApplicationMenu.Window, _action)
 
-    # Open the window immediately on plugin load
+    # Open the window immediately on load
     _show_window()
-    _log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} loaded.")
+    _log(f"{PLUGIN_NAME} v{PLUGIN_VERSION} loaded. Re-open via Window > Open Skin Pack Exporter")
 
 
 def _show_window():
