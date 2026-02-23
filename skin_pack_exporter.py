@@ -36,9 +36,11 @@ from typing import Optional, List, Dict, Any
 try:
     from PySide2 import QtWidgets, QtCore, QtGui
     from PySide2.QtCore import Qt
+    from PySide2.QtWidgets import QAction
 except ImportError:
     from PySide6 import QtWidgets, QtCore, QtGui   # type: ignore
     from PySide6.QtCore import Qt
+    from PySide6.QtGui import QAction
 
 # -- Substance Painter API ----------------------------------------------------
 import substance_painter.ui         as sp_ui
@@ -1194,9 +1196,11 @@ def start_plugin():
     global _dialog, _action
 
     # Register a menu action so the user can re-open the window at any time
-    _action = QtWidgets.QAction(PLUGIN_NAME, sp_ui.get_main_window())
+    _action = QAction(PLUGIN_NAME, sp_ui.get_main_window())
     _action.triggered.connect(_show_window)
-    sp_ui.add_action("Python/Plugins", _action)
+    
+    # Place the action in the Window menu instead of using a string path
+    sp_ui.add_action(sp_ui.ApplicationMenu.Window, _action)
 
     # Open the window immediately on plugin load
     _show_window()
