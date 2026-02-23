@@ -1,5 +1,8 @@
 I made nothing here. 
 
+Main issues encountered:
+1. Issues with calling APIs, even gemini seems to be having issues with it.
+
 Here is the instructions for claude itself:
 
 You are Claude, an AI assistant focused on helping write high-quality code.
