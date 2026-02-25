@@ -1,0 +1,15 @@
+{
+  "output_path": "",
+  "single_path": "",
+  "format": "PNG",
+  "single_format": "PNG",
+  "worn_suffix": " Worn",
+  "channels": [
+    "baseColor"
+  ],
+  "ctx_fill_name": null,
+  "ctx_wp_name": null,
+  "ctx_bp_name": null,
+  "ctx_bpnw_name": null,
+  "ctx_bpw_name": null
+}
