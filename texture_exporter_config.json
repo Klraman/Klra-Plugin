@@ -1,5 +1,5 @@
 {
-  "output_path": "",
+  "output_path": "D:/Deadline/Attachments/Lower receivers/AR15/Noveske Gen 3 Lower/noveske_n4_gen3_ar15_lower_receiver",
   "single_path": "",
   "format": "PNG",
   "single_format": "PNG",
@@ -9,7 +9,7 @@
   ],
   "ctx_fill_name": null,
   "ctx_wp_name": null,
-  "ctx_bp_name": null,
-  "ctx_bpnw_name": null,
-  "ctx_bpw_name": null
+  "ctx_bp_name": "Black Parts",
+  "ctx_bpnw_name": "!Skin Black (Any Mat)",
+  "ctx_bpw_name": "!Skin Black Worn (Metal)"
 }
