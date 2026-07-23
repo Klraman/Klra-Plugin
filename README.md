@@ -1,7 +1,10 @@
-I made nothing here. 
+<img width="1402" height="1161" alt="image" src="https://github.com/user-attachments/assets/bc3dd6c5-6960-4d9b-832d-879410d385e4" />I made nothing here. 
 
 Main issues encountered:
 1. Issues with calling APIs, even gemini seems to be having issues with it.
+
+
+Eventually though I found the file path where substance stores it, should be at `\Program Files\Adobe\Adobe Substance 3D Painter\resources\python-doc\substance_painter` for most.
 
 Here is the instructions for claude itself:
 
