@@ -47,7 +47,7 @@ Things to consider (no idea if feasible):
 2. Continue if either of the worn folder is missing. If both are present, there is most likely a black mask within the worn plastic part
 3. The program should allow me to choose to what folder within my file to export the textures into.
 4. When both worn folders are present, they would basically be exported at the same time. Lets say i finished exporting all the textures in the default folder and want to do tan worn texture of a mesh where both a are present, I would export at the same time, not separately. 
-5. I am using Substance painter version 11.1.2, ensure all APIs are updated. 
+5. I am using Substance painter version 12.1.0, ensure all APIs are updated. 
 6. For redundancy, it might be more worth it to allow me to check the skin pack layer so no naming issue comes up.
 7. Allow me choose the Output Template, though the default should just be called Base Color.
 
