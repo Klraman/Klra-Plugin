@@ -2,11 +2,24 @@
 Texture Exporter – v6
 Substance Painter 12.1.0  |  PySide6
 
+v6 changes:
+  1. Select All / Select None checkboxes for Texture Sets.
+  2. Clear All Paths button — wipes every per-TS path field at once.
+  3. Find Folders (deep) — recursively scans all subfolders under the
+     detected 'textures' root (up to depth 5) and matches each TS name
+     to the most specific subfolder using normalised prefix matching
+     (_norm_for_match / _collect_subfolders / _find_best_deep_match).
+     Replaces the old shallow one-level match.
+  4. Live progress dialog for Find Folders — streams every match decision
+     (✅ / ❌ / ⏭) in real time with a progress bar via processEvents().
+  5. TS buttons moved to top of the Texture Sets group (above the list).
+  6. Browse (Default Output Folder) silently auto-fills empty per-TS paths
+     after a folder is picked (non-destructive, no dialog).
+
 v5 changes:
   1. Removed Single Export tab — Batch Export is the sole interface.
   2. Fixed completion popup — NameError in total variable resolved.
   3. ExportStatus.Warning now treated as soft success (files still written).
-  4. Auto find paths now uses a "textures" folder as the anchor point, not the first parent of the default output path.
 
 API references (uploaded docs):
   ui.html         → ApplicationMenu.Window, add_action, get_main_window
@@ -16,7 +29,9 @@ API references (uploaded docs):
                     exportShaderParams, exportPresets, exportList (rootPath,
                     $textureSet wildcard), exportParameters; srcMapName values:
                     baseColor, roughness, metallic, normal, height, emissive,
-                    opacity, ambientOcclusion, specular
+                    opacity, ambientOcclusion, specular;
+                    meshMap srcMapName values: curvature, ambient_occlusion,
+                    id, normal_base, world_space_normals, position, thickness
   textureset.html → TextureSet.name, TextureSet.is_layered_material(),
                     TextureSet.get_stack(), all_texture_sets()
   navigation.html → get_root_layer_nodes, GroupLayerNode.sub_layers(),
@@ -24,6 +39,7 @@ API references (uploaded docs):
                     LayerNode.content_effects(), LayerNode.mask_effects()
   filter.html     → FilterEffectNode (inherits Node)
   fill.html       → FillLayerNode (inherits LayerNode)
+  baking.html     → CurvatureMethod (reference only)
 
 Install: Documents/Adobe/Adobe Substance 3D Painter/python/plugins/
 Open:    Window ▶ Texture Exporter…
@@ -47,7 +63,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QComboBox, QLineEdit,
     QFileDialog, QGroupBox, QMessageBox, QSizePolicy,
     QProgressBar, QTextEdit, QScrollArea,
-    QCheckBox,
+    QCheckBox, QDialog,
 )
 from PySide6.QtCore import Qt, QCoreApplication
 
@@ -362,38 +378,93 @@ def _find_textures_root(path: str) -> str | None:
         p = parent
 
 
-def _find_best_folder_match(ts_name: str, available_folders: list[str]) -> str | None:
-    """
-    Return the subfolder from `available_folders` that best matches `ts_name`.
-
-    Matching rule: the TS name (lowercased, - and space normalised to _) must
-    equal the folder name OR start with '<folder_name>_'.  Longest match wins
-    so 'extra1_barrel' beats 'extra1' when both exist.
-
-    Example: 'barrels_4.4_Bar-Sto_Threaded' + ['barrels','extra1','frames']
-             → 'barrels'   (ts.lower().startswith('barrels_'))
-    """
-    ts_norm = ts_name.lower().replace("-", "_").replace(" ", "_")
-    best: str | None = None
-    best_len = 0
-    for folder in available_folders:
-        fn_norm = folder.lower().replace("-", "_").replace(" ", "_")
-        if ts_norm == fn_norm or ts_norm.startswith(fn_norm + "_"):
-            if len(fn_norm) > best_len:
-                best     = folder
-                best_len = len(fn_norm)
-    return best
-
-
-
+def _resolve_meshmap_dir(base_path: str, sibling: bool) -> str:
     """
     Return the Curvature+AO output folder path.
-      sibling=False → <base_path>/Curvature+AO      (subfolder inside output)
-      sibling=True  → <parent_of_base_path>/Curvature+AO  (folder alongside output)
+      sibling=False → <base_path>/Curvature+AO
+      sibling=True  → <parent_of_base_path>/Curvature+AO
     """
-    base = base_path.rstrip("/").rstrip("\\")
+    base   = base_path.rstrip("/").rstrip("\\")
     parent = os.path.dirname(base) if sibling else base
     return (parent + "/Curvature+AO").replace("\\", "/")
+
+
+# ── Deep folder-matching helpers ──────────────────────────────────────────────
+
+def _norm_for_match(s: str) -> str:
+    """Lowercase + collapse every separator (_  -  space  /  \\) to a single space."""
+    return re.sub(r'[\s_\-/\\]+', ' ', s.lower()).strip()
+
+
+def _collect_subfolders(root: str, max_depth: int = 5) -> list:
+    """
+    Recursively collect every subfolder under `root` up to `max_depth` levels.
+    Returns a list of (norm_rel, abs_path) where norm_rel is the relative path
+    from root after _norm_for_match normalisation.
+
+    Example (max_depth=2):
+      root = D:/Guns/P226/textures
+      → ('barrels',              'D:/…/textures/barrels')
+      → ('barrels 4.4 bar sto',  'D:/…/textures/barrels/4.4 bar sto')
+      → ('barrels 5.0 oem threaded', '…')
+      → ('extra1',               '…')
+      → …
+    """
+    results: list = []
+
+    def _walk(path: str, rel_parts: list, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            for entry in sorted(os.scandir(path), key=lambda e: e.name.lower()):
+                if entry.is_dir(follow_symlinks=False):
+                    new_parts = rel_parts + [entry.name]
+                    norm_rel  = _norm_for_match(" ".join(new_parts))
+                    results.append((norm_rel, entry.path.replace("\\", "/")))
+                    _walk(entry.path, new_parts, depth + 1)
+        except OSError:
+            pass
+
+    _walk(root, [], 0)
+    return results
+
+
+def _find_best_deep_match(ts_name: str, all_folders: list) -> tuple:
+    """
+    Find the most-specific subfolder for `ts_name` from a list produced by
+    _collect_subfolders.  Returns (abs_path | None, display_reason_str).
+
+    Rule: the normalised TS name must equal the normalised relative path OR
+    start with it followed by a space.  The longest (most specific) match wins.
+
+    Example:
+      ts_name = 'barrels_4.4_Bar-Sto_Threaded'
+      norm    = 'barrels 4.4 bar sto threaded'
+
+      'barrels'             starts with → score  7
+      'barrels 4.4'         starts with → score 11
+      'barrels 4.4 bar sto' starts with → score 19  ← winner
+    """
+    ts_norm    = _norm_for_match(ts_name)
+    best_abs   = None
+    best_score = -1
+    best_rel   = ""
+
+    for norm_rel, abs_path in all_folders:
+        if ts_norm == norm_rel or ts_norm.startswith(norm_rel + " "):
+            score = len(norm_rel)
+            if score > best_score:
+                best_score = score
+                best_abs   = abs_path
+                best_rel   = norm_rel
+
+    if best_abs:
+        short = "/".join(best_abs.split("/")[-2:])   # last two segments for display
+        return best_abs, f"✅  {ts_name}\n        → …/{short}"
+    return None, f"❌  {ts_name}  (no match)"
+
+
+
 
 
 
@@ -533,15 +604,10 @@ class TextureExporterWindow(QWidget):
             "TSes sharing the same path are batched in one export call."
         )
         note.setWordWrap(True); note.setStyleSheet("color:#aaa;font-size:11px;"); tg.addWidget(note)
-        self._ts_container = QWidget()
-        self._ts_layout    = QVBoxLayout(self._ts_container)
-        self._ts_layout.setContentsMargins(0, 0, 0, 0); self._ts_layout.setSpacing(3)
-        tg.addWidget(self._ts_container)
 
-        # ── TS bottom button row ───────────────────────────────────────────────
+        # ── TS button row — sits right below the note ──────────────────────────
         ts_btn_row = QHBoxLayout()
 
-        # Select All / Select None
         sel_all_btn  = QPushButton("☑ All");  sel_all_btn.setFixedWidth(54)
         sel_none_btn = QPushButton("☐ None"); sel_none_btn.setFixedWidth(54)
         sel_all_btn.setToolTip("Check all Texture Sets")
@@ -550,16 +616,19 @@ class TextureExporterWindow(QWidget):
         sel_none_btn.clicked.connect(lambda: self._set_all_ts_checked(False))
         ts_btn_row.addWidget(sel_all_btn)
         ts_btn_row.addWidget(sel_none_btn)
-        ts_btn_row.addSpacing(8)
+        ts_btn_row.addSpacing(6)
 
-        # Find Folders — guesses per-TS output paths from the textures root
+        clr_btn = QPushButton("🗑 Clear Paths")
+        clr_btn.setToolTip("Clear all per-TS output path fields\n(they will fall back to the Default Output Folder)")
+        clr_btn.clicked.connect(self._clear_all_ts_paths)
+        ts_btn_row.addWidget(clr_btn)
+        ts_btn_row.addSpacing(6)
+
         find_btn = QPushButton("🔍  Find Folders")
         find_btn.setToolTip(
-            "Walks up from the Default Output Folder until a folder named\n"
-            "'textures' is found, then matches each Texture Set name to a\n"
-            "subfolder inside it.\n\n"
-            "Overwrites ALL per-TS paths with matched results.\n"
-            "TSes with no match are left unchanged."
+            "Recursively searches subfolders under the detected 'textures' root\n"
+            "and matches each Texture Set name to the most specific subfolder.\n\n"
+            "A progress window shows every decision in real time."
         )
         find_btn.clicked.connect(self._find_ts_folders)
         ts_btn_row.addWidget(find_btn)
@@ -571,6 +640,12 @@ class TextureExporterWindow(QWidget):
         ts_btn_row.addWidget(btn_ref_ts)
 
         tg.addLayout(ts_btn_row)
+
+        # ── Scrollable TS list ─────────────────────────────────────────────────
+        self._ts_container = QWidget()
+        self._ts_layout    = QVBoxLayout(self._ts_container)
+        self._ts_layout.setContentsMargins(0, 0, 0, 0); self._ts_layout.setSpacing(3)
+        tg.addWidget(self._ts_container)
         lay.addWidget(ts_grp)
 
         # ── Channels ──────────────────────────────────────────────────────────
@@ -1026,29 +1101,32 @@ class TextureExporterWindow(QWidget):
         for w in self._ts_widgets.values():
             w["check"].setChecked(state)
 
+    def _clear_all_ts_paths(self):
+        """Clear every per-TS path field (they fall back to the Default Output Folder)."""
+        for w in self._ts_widgets.values():
+            w["path"].clear()
+
     def _browse_default_and_find(self):
         """
-        Browse for the global default output folder, then automatically fill
-        any EMPTY per-TS path fields whose TS name matches a subfolder under
-        the detected 'textures' root (same logic as 'Find Folders' but
-        non-destructive — never overwrites a path the user already set).
+        Browse for the global default folder, then silently fill empty per-TS
+        paths using the deep folder-match algorithm (non-destructive, no dialog).
         """
         self._browse(self._b_path)
-        chosen = self._b_path.text().strip()
-        if chosen:
-            self._find_ts_folders(overwrite_existing=False)
+        if self._b_path.text().strip():
+            self._find_ts_folders(show_dialog=False, overwrite_existing=False)
 
-    def _find_ts_folders(self, overwrite_existing: bool = True):
+    def _find_ts_folders(self, show_dialog: bool = True, overwrite_existing: bool = True):
         """
-        Walk up from the current default output folder to find the 'textures'
-        root, then match each TS name to a subfolder inside it.
+        Walk up from the Default Output Folder to find the 'textures' root,
+        recursively collect all subfolders (up to depth 5), then match every
+        TS name to the most specific subfolder using normalised prefix matching.
 
-        overwrite_existing=True  (manual button): sets ALL matched TS paths.
-        overwrite_existing=False (post-browse):   only fills EMPTY TS paths.
+        show_dialog=True    : live progress window showing every match decision.
+        overwrite_existing  : if False, only fills currently-empty path fields.
         """
         base = self._b_path.text().strip()
         if not base:
-            if overwrite_existing:   # only nag when user clicked the button
+            if show_dialog:
                 QMessageBox.warning(self, "No Default Path",
                     "Set a Default Output Folder first so the plugin knows\n"
                     "where to start looking for a 'textures' folder.")
@@ -1056,49 +1134,105 @@ class TextureExporterWindow(QWidget):
 
         textures_root = _find_textures_root(base)
         if textures_root is None:
-            if overwrite_existing:
+            if show_dialog:
                 QMessageBox.warning(self, "No 'textures' Folder Found",
                     f"Could not find a folder named 'textures' (case-insensitive)\n"
                     f"anywhere above:\n  {base}\n\n"
-                    f"Make sure the default output path is inside or equal to a\n"
-                    f"folder called 'textures'.")
+                    f"Make sure the Default Output Folder is inside a folder\n"
+                    f"called 'textures'.")
             return
 
-        # List immediate subfolders of the textures root
-        try:
-            subfolders = [
-                d for d in os.listdir(textures_root)
-                if os.path.isdir(os.path.join(textures_root, d))
-            ]
-        except Exception as e:
-            QMessageBox.warning(self, "Folder Error", f"Could not read {textures_root}:\n{e}")
+        # ── Build progress dialog ─────────────────────────────────────────────
+        if show_dialog:
+            dlg = QDialog(self)
+            dlg.setWindowTitle("🔍 Finding Folders…")
+            dlg.setMinimumWidth(580)
+            dlg.setMinimumHeight(380)
+            dlg_lay = QVBoxLayout(dlg)
+
+            dlg_info = QLabel(f"Textures root:  {textures_root}")
+            dlg_info.setStyleSheet("font-size:11px; color:#bbb;")
+            dlg_lay.addWidget(dlg_info)
+
+            dlg_scan_lbl = QLabel("Scanning subfolders…")
+            dlg_scan_lbl.setStyleSheet("font-size:11px; color:#aaa;")
+            dlg_lay.addWidget(dlg_scan_lbl)
+
+            dlg_bar = QProgressBar()
+            dlg_bar.setRange(0, 0)        # indeterminate spinner during scan
+            dlg_bar.setFormat("Scanning…")
+            dlg_lay.addWidget(dlg_bar)
+
+            dlg_log = QTextEdit()
+            dlg_log.setReadOnly(True)
+            dlg_log.setStyleSheet("font-family: monospace; font-size:11px;")
+            dlg_log.setMinimumHeight(220)
+            dlg_lay.addWidget(dlg_log)
+
+            dlg_close = QPushButton("Close")
+            dlg_close.setEnabled(False)   # enabled only when done
+            dlg_close.clicked.connect(dlg.accept)
+            dlg_lay.addWidget(dlg_close, alignment=Qt.AlignRight)
+
+            dlg.show()
+            QCoreApplication.processEvents()
+
+        # ── Recursively collect all subfolders ────────────────────────────────
+        all_folders = _collect_subfolders(textures_root, max_depth=5)
+
+        if show_dialog:
+            dlg_scan_lbl.setText(
+                f"Found {len(all_folders)} subfolders (max depth 5) — matching {len(self._ts_widgets)} Texture Sets…"
+            )
+            dlg_bar.setRange(0, max(1, len(self._ts_widgets)))
+            dlg_bar.setValue(0)
+            dlg_bar.setFormat("%v / %m  TSes")
+            QCoreApplication.processEvents()
+
+        if not all_folders:
+            if show_dialog:
+                dlg_log.append("⚠  No subfolders found under the textures root.")
+                dlg_close.setEnabled(True)
             return
 
-        if not subfolders:
-            if overwrite_existing:
-                QMessageBox.information(self, "No Subfolders",
-                    f"The textures folder has no subfolders:\n  {textures_root}")
-            return
+        # ── Match each TS — one processEvents per row so the user sees it live ─
+        matched = skipped = unmatched = 0
 
-        matched = unmatched = 0
-        for ts_name, w in self._ts_widgets.items():
-            current_path = w["path"].text().strip()
-            if not overwrite_existing and current_path:
-                continue   # non-destructive pass — skip already-set paths
+        for i, (ts_name, w) in enumerate(self._ts_widgets.items()):
+            current = w["path"].text().strip()
 
-            best = _find_best_folder_match(ts_name, subfolders)
-            if best:
-                full_path = (textures_root + "/" + best).replace("\\", "/")
-                w["path"].setText(full_path)
+            if not overwrite_existing and current:
+                if show_dialog:
+                    dlg_log.append(f"⏭  {ts_name}  (already set — skipped)")
+                    dlg_bar.setValue(i + 1)
+                    QCoreApplication.processEvents()
+                skipped += 1
+                continue
+
+            abs_path, reason = _find_best_deep_match(ts_name, all_folders)
+
+            if show_dialog:
+                dlg_log.append(reason)
+                dlg_bar.setValue(i + 1)
+                QCoreApplication.processEvents()
+
+            if abs_path:
+                w["path"].setText(abs_path)
                 matched += 1
             else:
                 unmatched += 1
 
-        if overwrite_existing:
-            msg = f"Matched {matched} / {len(self._ts_widgets)} Texture Sets to subfolders in:\n  {textures_root}"
-            if unmatched:
-                msg += f"\n\n{unmatched} TS(es) had no matching subfolder — their paths were not changed."
-            QMessageBox.information(self, "Find Folders — Done", msg)
+        # ── Summary ───────────────────────────────────────────────────────────
+        if show_dialog:
+            dlg_bar.setValue(len(self._ts_widgets))
+            dlg_bar.setFormat("Done")
+            dlg_log.append(
+                f"\n── Summary ──────────────────────────\n"
+                f"✅  Matched  : {matched}\n"
+                f"❌  No match : {unmatched}\n"
+                f"⏭  Skipped  : {skipped}  (already had a path)"
+            )
+            dlg_close.setEnabled(True)
 
     def _browse(self, target: QLineEdit):
         folder = QFileDialog.getExistingDirectory(
