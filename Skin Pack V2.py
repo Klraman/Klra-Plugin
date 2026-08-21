@@ -1,28 +1,20 @@
 """
-Texture Exporter – v4
-Substance Painter 11.1.2  |  PySide6
+Texture Exporter – v6
+Substance Painter 12.1.0  |  PySide6
 
-v4 changes:
-  1. Per-TS output paths   – each Texture Set row now has its own path field
-                             and Browse button. Leave it blank to use the global
-                             default path. TSes sharing the same resolved path
-                             are batched in one call (with $textureSet prefix);
-                             TSes with different paths get separate calls.
-  2. Reliable batch cancel – processEvents() is now called immediately after
-                             every export_project_textures() returns, so cancel
-                             button clicks register at the earliest possible
-                             moment regardless of how long each export took.
-  3. Category filter       – Normal / Worn / Bright checkboxes above the run
-                             button. Unchecked categories are skipped entirely;
-                             the progress bar max and file count reflect only
-                             the categories that will actually run.
+v5 changes:
+  1. Removed Single Export tab — Batch Export is the sole interface.
+  2. Fixed completion popup — NameError in total variable resolved.
+  3. ExportStatus.Warning now treated as soft success (files still written).
+  4. Auto find paths now uses a "textures" folder as the anchor point, not the first parent of the default output path.
 
 API references (uploaded docs):
   ui.html         → ApplicationMenu.Window, add_action, get_main_window
-  export.html     → export_project_textures, ExportStatus, exportShaderParams,
-                    exportPresets, exportList (rootPath, $textureSet wildcard),
-                    exportParameters, list_predefined_export_presets,
-                    list_resource_export_presets; srcMapName values:
+  export.html     → export_project_textures, ExportStatus (Success/Warning/
+                    Cancelled/Error), TextureExportResult (status, message,
+                    textures: Dict[Tuple[str,str], List[str]]),
+                    exportShaderParams, exportPresets, exportList (rootPath,
+                    $textureSet wildcard), exportParameters; srcMapName values:
                     baseColor, roughness, metallic, normal, height, emissive,
                     opacity, ambientOcclusion, specular
   textureset.html → TextureSet.name, TextureSet.is_layered_material(),
@@ -54,7 +46,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QLineEdit,
     QFileDialog, QGroupBox, QMessageBox, QSizePolicy,
-    QProgressBar, QTextEdit, QTabWidget, QScrollArea,
+    QProgressBar, QTextEdit, QScrollArea,
     QCheckBox,
 )
 from PySide6.QtCore import Qt, QCoreApplication
@@ -157,16 +149,26 @@ def find_skin_pack_root(stack):
 
 
 def categorize_level2(skin_pack_node):
-    """Returns (normal_cat, bright_cats, worn_plastic, worn_metal)."""
+    """Returns (normal_cat, bright_cats, worn_plastic, worn_metal).
+
+    Worn detection priority:
+      1. Two groups with identical child counts → classic plastic/metal pair.
+      2. A single group whose name contains 'worn', 'plastic', or 'metal' but
+         no same-count partner was found → solo worn group (worn_p set, worn_m=None).
+      3. Everything else → standalone, largest becomes Normal, rest become Bright.
+    """
     level2   = _group_children(skin_pack_node)
     by_count = {}
     for c in level2:
         by_count.setdefault(len(_group_children(c)), []).append(c)
 
+    WORN_HINTS = ('worn', 'plastic', 'metal')
+
     worn_p = worn_m = None
     standalone = []
     for cats in by_count.values():
         if len(cats) == 2:
+            # Classic pair: same child count → plastic + metal
             a, b = cats
             an, bn = a.get_name().lower(), b.get_name().lower()
             if 'plastic' in an or 'metal' in bn:     worn_p, worn_m = a, b
@@ -176,6 +178,17 @@ def categorize_level2(skin_pack_node):
                 worn_p, worn_m = (a, b) if order[a] < order[b] else (b, a)
         else:
             standalone.extend(cats)
+
+    # If no pair was found, check standalones for a solo worn group by name hint.
+    # This handles the case where Worn Metal has been deleted and only Worn Plastic
+    # remains — without this it would fall through to "bright" and never get the
+    # correct contextual toggles (bp_worn visible, invert on, etc.).
+    if worn_p is None:
+        for c in standalone:
+            if any(h in c.get_name().lower() for h in WORN_HINTS):
+                worn_p = c          # solo worn — worn_m stays None
+                standalone = [x for x in standalone if x is not c]
+                break
 
     order = {c: i for i, c in enumerate(level2)}
     standalone.sort(key=lambda c: order[c])
@@ -200,6 +213,7 @@ def build_export_jobs(skin_pack_node):
 
     if normal: _add(normal, "normal")
     if worn_p and worn_m:
+        # Classic pair: plastic + metal exported together, one job per skin index
         all_cats.extend([worn_p, worn_m])
         ps, ms = _group_children(worn_p), _group_children(worn_m)
         all_skins.extend(ps + ms)
@@ -208,6 +222,11 @@ def build_export_jobs(skin_pack_node):
             jobs.append({"filename": clean_skin_name(ps[i].get_name()),
                          "show": [ps[i], ms[i]], "all_in_category": all_worn,
                          "cat_type": "worn"})
+    elif worn_p:
+        # Solo worn group (e.g. Worn Metal was deleted): export like normal/bright
+        # but keep cat_type="worn" so contextual toggles (invert on, bp_worn
+        # visible) are applied correctly.
+        _add(worn_p, "worn")
     for cat in bright_cats: _add(cat, "bright")
     return jobs, all_skins, all_cats
 
@@ -277,9 +296,107 @@ def build_export_config(
     }
 
 
-# =============================================================================
-# ── Auto-detect contextual layers ─────────────────────────────────────────────
-# =============================================================================
+def build_meshmap_export_config(
+    ts_root_paths: list,
+    out_dir: str,
+    sp_format: str,
+    multi_ts: bool,
+) -> dict:
+    """
+    Export curvature and AO baked mesh maps (srcMapType: "meshMap").
+    These are baked per-mesh and do NOT change with skin layer visibility,
+    so they are exported once per texture set — never once per skin.
+
+    srcMapName values per 12.1.0 docs:
+      "curvature"         → curvature mesh map
+      "ambient_occlusion" → ambient occlusion mesh map
+
+    Filename scheme mirrors build_export_config:
+      1 TS  → {Curvature|AO}
+      N TSes → $textureSet_{Curvature|AO}
+    """
+    prefix = "$textureSet_" if multi_ts else ""
+    maps = [
+        {
+            "fileName": f"{prefix}Curvature",
+            "channels": [{"destChannel": "L", "srcChannel": "L",
+                          "srcMapType": "meshMap", "srcMapName": "curvature"}],
+        },
+        {
+            "fileName": f"{prefix}AO",
+            "channels": [{"destChannel": "L", "srcChannel": "L",
+                          "srcMapType": "meshMap", "srcMapName": "ambient_occlusion"}],
+        },
+    ]
+    return {
+        "exportShaderParams": False,
+        "exportPath":         out_dir,
+        "exportPresets":      [{"name": "MeshMaps", "maps": maps}],
+        "defaultExportPreset": "MeshMaps",
+        "exportList":         [{"rootPath": rp} for rp in ts_root_paths],
+        "exportParameters":   [{"parameters": {
+            "fileFormat":       sp_format,
+            "bitDepth":         "8",   # baked maps are always 8-bit
+            "dithering":        False,
+            "paddingAlgorithm": "infinite",
+            "dilationDistance": 16,
+        }}],
+    }
+
+
+def _find_textures_root(path: str) -> str | None:
+    """
+    Walk UP from `path` until a folder literally named 'textures' (case-insensitive)
+    is found. Returns that folder's path, or None if never found.
+
+    Example: 'D:/Guns/P226/textures/barrels' → 'D:/Guns/P226/textures'
+             'D:/Guns/P226/textures'          → 'D:/Guns/P226/textures'
+    """
+    p = os.path.normpath(path)
+    while True:
+        if os.path.basename(p).lower() == "textures":
+            return p.replace("\\", "/")
+        parent = os.path.dirname(p)
+        if parent == p:          # hit filesystem root
+            return None
+        p = parent
+
+
+def _find_best_folder_match(ts_name: str, available_folders: list[str]) -> str | None:
+    """
+    Return the subfolder from `available_folders` that best matches `ts_name`.
+
+    Matching rule: the TS name (lowercased, - and space normalised to _) must
+    equal the folder name OR start with '<folder_name>_'.  Longest match wins
+    so 'extra1_barrel' beats 'extra1' when both exist.
+
+    Example: 'barrels_4.4_Bar-Sto_Threaded' + ['barrels','extra1','frames']
+             → 'barrels'   (ts.lower().startswith('barrels_'))
+    """
+    ts_norm = ts_name.lower().replace("-", "_").replace(" ", "_")
+    best: str | None = None
+    best_len = 0
+    for folder in available_folders:
+        fn_norm = folder.lower().replace("-", "_").replace(" ", "_")
+        if ts_norm == fn_norm or ts_norm.startswith(fn_norm + "_"):
+            if len(fn_norm) > best_len:
+                best     = folder
+                best_len = len(fn_norm)
+    return best
+
+
+
+    """
+    Return the Curvature+AO output folder path.
+      sibling=False → <base_path>/Curvature+AO      (subfolder inside output)
+      sibling=True  → <parent_of_base_path>/Curvature+AO  (folder alongside output)
+    """
+    base = base_path.rstrip("/").rstrip("\\")
+    parent = os.path.dirname(base) if sibling else base
+    return (parent + "/Curvature+AO").replace("\\", "/")
+
+
+
 def _auto_detect_ctx(stack, skin_root):
     result = {"fill": None, "bp_group": None, "bp_nonworn": None, "bp_worn": None}
     best = fallback = None
@@ -297,19 +414,29 @@ def _auto_detect_ctx(stack, skin_root):
             if not _is_group(node): continue
             if skin_root is not None and node is skin_root: continue
             children = [c for c in node.sub_layers() if _is_proper_layer(c)]
-            if len(children) >= 2:
-                result["bp_group"] = node
-                worn_ch = nonworn_ch = None
-                for ch in children:
-                    if "worn" in ch.get_name().lower():
-                        if not worn_ch:    worn_ch    = ch
-                    else:
-                        if not nonworn_ch: nonworn_ch = ch
-                if not nonworn_ch and children:    nonworn_ch = children[0]
-                if not worn_ch and len(children) >= 2: worn_ch = children[1]
-                result["bp_nonworn"] = nonworn_ch
-                result["bp_worn"]    = worn_ch
-                break
+            if len(children) < 2:
+                continue
+            # ── Name-hint guard ──────────────────────────────────────────────
+            # Require at least one child whose name contains "worn" or "black"
+            # (case-insensitive). Without this, any unrelated root group that
+            # happens to have ≥2 layers (e.g. a generic "Folder 1") would be
+            # incorrectly picked as the Black Parts group before the real one
+            # is reached, because detection is positional (top-to-bottom).
+            child_names = [c.get_name().lower() for c in children]
+            if not any("worn" in n or "black" in n for n in child_names):
+                continue  # not the BP group — keep looking
+            result["bp_group"] = node
+            worn_ch = nonworn_ch = None
+            for ch in children:
+                if "worn" in ch.get_name().lower():
+                    if not worn_ch:    worn_ch    = ch
+                else:
+                    if not nonworn_ch: nonworn_ch = ch
+            if not nonworn_ch and children:        nonworn_ch = children[0]
+            if not worn_ch and len(children) >= 2: worn_ch    = children[1]
+            result["bp_nonworn"] = nonworn_ch
+            result["bp_worn"]    = worn_ch
+            break
     except Exception: pass
     return result
 
@@ -328,14 +455,15 @@ class TextureExporterWindow(QWidget):
         self.setMinimumHeight(640)
         self.setWindowFlags(Qt.Window)
         self._last_dir         = ""
-        self._preset_data      = []
         self._batch_running    = False
         self._cancel_requested = False
-        # {ts_name: {"check": QCheckBox, "path": QLineEdit}}
+        # {ts_name: {"check": QCheckBox, "path": QLineEdit, "browse": QPushButton}}
         self._ts_widgets       = {}
         self._channel_checks   = {}   # {srcMapName: QCheckBox}
         self._cat_checks       = {}   # {"normal": QCheckBox, ...}
         self._saved_ctx        = {}
+        self._mm_enabled       = None  # set in _build_batch_tab
+        self._mm_location      = None  # set in _build_batch_tab
         self._build_ui()
         self._load_config()
 
@@ -346,55 +474,31 @@ class TextureExporterWindow(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
-        tabs = QTabWidget()
-        tabs.addTab(self._build_single_tab(), "Single Export")
-        tabs.addTab(self._build_batch_tab(),  "Batch Export")
-        root.addWidget(tabs)
+        root.addWidget(self._build_batch_tab())
 
     # =========================================================================
-    # ── Tab 1: Single Export ──────────────────────────────────────────────────
+    # ── Tab: Batch Export (now the only view) ─────────────────────────────────
     # =========================================================================
-    def _build_single_tab(self):
-        w = QWidget(); lay = QVBoxLayout(w); lay.setSpacing(8); lay.setContentsMargins(8,8,8,8)
-
-        grp = QGroupBox("Output Template Preset"); g = QVBoxLayout(grp)
-        row = QHBoxLayout(); row.addWidget(QLabel("Preset:"))
-        self._s_preset = QComboBox(); self._s_preset.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        row.addWidget(self._s_preset)
-        b = QPushButton("↺"); b.setFixedWidth(28); b.clicked.connect(self._refresh_presets); row.addWidget(b)
-        g.addLayout(row); lay.addWidget(grp)
-
-        grp2 = QGroupBox("Layer (output filename)"); g2 = QVBoxLayout(grp2)
-        row2 = QHBoxLayout(); row2.addWidget(QLabel("Layer:"))
-        self._s_layer = QComboBox(); self._s_layer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        row2.addWidget(self._s_layer)
-        b2 = QPushButton("↺"); b2.setFixedWidth(28); b2.clicked.connect(self._refresh_single_layers); row2.addWidget(b2)
-        g2.addLayout(row2); lay.addWidget(grp2)
-
-        grp3 = QGroupBox("Export Settings"); g3 = QVBoxLayout(grp3); g3.setSpacing(6)
-        pr = QHBoxLayout(); pr.addWidget(QLabel("Output Folder:"))
-        self._s_path = QLineEdit(); self._s_path.setPlaceholderText("Browse…")
-        self._s_path.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); pr.addWidget(self._s_path)
-        bb = QPushButton("Browse…"); bb.setFixedWidth(68); bb.clicked.connect(lambda: self._browse(self._s_path)); pr.addWidget(bb)
-        g3.addLayout(pr)
-        fr = QHBoxLayout(); fr.addWidget(QLabel("Format:"))
-        self._s_fmt = QComboBox()
-        for lbl in self.FORMATS: self._s_fmt.addItem(lbl)
-        self._s_fmt.setFixedWidth(80); fr.addWidget(self._s_fmt); fr.addStretch()
-        g3.addLayout(fr); lay.addWidget(grp3)
-
-        btn = QPushButton("Export Texture"); btn.setFixedHeight(28); btn.clicked.connect(self._single_export); lay.addWidget(btn)
-        self._s_status = QLabel(""); self._s_status.setWordWrap(True); self._s_status.setAlignment(Qt.AlignCenter); lay.addWidget(self._s_status)
-        lay.addStretch()
-        self._refresh_presets(); self._refresh_single_layers()
-        return w
-
-    # =========================================================================
-    # ── Tab 2: Batch Export ───────────────────────────────────────────────────
     # =========================================================================
     def _build_batch_tab(self):
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QScrollArea.NoFrame)
         w = QWidget(); lay = QVBoxLayout(w); lay.setSpacing(8); lay.setContentsMargins(8,8,8,8)
+
+        # ── Top cancel button (mirrors the one at the bottom) ─────────────────
+        # Useful when the scroll position is at the top during a long export.
+        top_cancel_row = QHBoxLayout()
+        self._b_cancel_btn_top = QPushButton("⏹ Cancel")
+        self._b_cancel_btn_top.setFixedHeight(28)
+        self._b_cancel_btn_top.setEnabled(False)
+        self._b_cancel_btn_top.setStyleSheet(
+            "QPushButton          {background:#8b2020;color:white;}"
+            "QPushButton:hover    {background:#b03030;}"
+            "QPushButton:disabled {background:#444;color:#888;}"
+        )
+        self._b_cancel_btn_top.clicked.connect(self._request_cancel)
+        top_cancel_row.addStretch()
+        top_cancel_row.addWidget(self._b_cancel_btn_top)
+        lay.addLayout(top_cancel_row)
 
         # ── Global format / worn suffix ───────────────────────────────────────
         fmt_grp = QGroupBox("Export Settings"); fg = QVBoxLayout(fmt_grp); fg.setSpacing(6)
@@ -414,12 +518,15 @@ class TextureExporterWindow(QWidget):
         gpr = QHBoxLayout(); gpr.addWidget(QLabel("Default Output Folder:"))
         self._b_path = QLineEdit(); self._b_path.setPlaceholderText("Used for any Texture Set with no path set")
         self._b_path.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); gpr.addWidget(self._b_path)
-        gbb = QPushButton("Browse…"); gbb.setFixedWidth(68); gbb.clicked.connect(lambda: self._browse(self._b_path)); gpr.addWidget(gbb)
+        gbb = QPushButton("Browse…"); gbb.setFixedWidth(68)
+        # After picking a folder, auto-fill any empty per-TS paths that match subfolders
+        gbb.clicked.connect(self._browse_default_and_find)
+        gpr.addWidget(gbb)
         fg.addLayout(gpr)
         lay.addWidget(fmt_grp)
 
         # ── Texture Sets (with per-TS path) ───────────────────────────────────
-        ts_grp = QGroupBox("Texture Sets & Output Paths"); tg = QVBoxLayout(ts_grp)
+        ts_grp = QGroupBox("Texture Sets  &  Output Paths"); tg = QVBoxLayout(ts_grp)
         note = QLabel(
             "Each Texture Set can export to its own folder. "
             "Leave blank to use the Default Output Folder above.\n"
@@ -430,7 +537,40 @@ class TextureExporterWindow(QWidget):
         self._ts_layout    = QVBoxLayout(self._ts_container)
         self._ts_layout.setContentsMargins(0, 0, 0, 0); self._ts_layout.setSpacing(3)
         tg.addWidget(self._ts_container)
-        btn_ref_ts = QPushButton("↺  Refresh Texture Sets"); btn_ref_ts.clicked.connect(self._refresh_ts_list); tg.addWidget(btn_ref_ts)
+
+        # ── TS bottom button row ───────────────────────────────────────────────
+        ts_btn_row = QHBoxLayout()
+
+        # Select All / Select None
+        sel_all_btn  = QPushButton("☑ All");  sel_all_btn.setFixedWidth(54)
+        sel_none_btn = QPushButton("☐ None"); sel_none_btn.setFixedWidth(54)
+        sel_all_btn.setToolTip("Check all Texture Sets")
+        sel_none_btn.setToolTip("Uncheck all Texture Sets")
+        sel_all_btn.clicked.connect(lambda: self._set_all_ts_checked(True))
+        sel_none_btn.clicked.connect(lambda: self._set_all_ts_checked(False))
+        ts_btn_row.addWidget(sel_all_btn)
+        ts_btn_row.addWidget(sel_none_btn)
+        ts_btn_row.addSpacing(8)
+
+        # Find Folders — guesses per-TS output paths from the textures root
+        find_btn = QPushButton("🔍  Find Folders")
+        find_btn.setToolTip(
+            "Walks up from the Default Output Folder until a folder named\n"
+            "'textures' is found, then matches each Texture Set name to a\n"
+            "subfolder inside it.\n\n"
+            "Overwrites ALL per-TS paths with matched results.\n"
+            "TSes with no match are left unchanged."
+        )
+        find_btn.clicked.connect(self._find_ts_folders)
+        ts_btn_row.addWidget(find_btn)
+        ts_btn_row.addStretch()
+
+        btn_ref_ts = QPushButton("↺  Refresh")
+        btn_ref_ts.setFixedWidth(80)
+        btn_ref_ts.clicked.connect(self._refresh_ts_list)
+        ts_btn_row.addWidget(btn_ref_ts)
+
+        tg.addLayout(ts_btn_row)
         lay.addWidget(ts_grp)
 
         # ── Channels ──────────────────────────────────────────────────────────
@@ -444,7 +584,42 @@ class TextureExporterWindow(QWidget):
             cg.addWidget(cb, 1 + i // 3, i % 3)
         lay.addWidget(ch_grp)
 
-        # ── Category filter ───────────────────────────────────────────────────
+        # ── Curvature + AO export ─────────────────────────────────────────────
+        mm_grp = QGroupBox("Curvature + AO Export"); mmg = QVBoxLayout(mm_grp); mmg.setSpacing(6)
+        mm_note = QLabel(
+            "Exports the baked Curvature and AO mesh maps once per Texture Set "
+            "(not per-skin). Uses the same format as the batch above."
+        )
+        mm_note.setWordWrap(True); mm_note.setStyleSheet("color:#aaa;font-size:11px;"); mmg.addWidget(mm_note)
+
+        mm_opt_row = QHBoxLayout()
+        self._mm_enabled = QCheckBox("Run automatically after batch")
+        self._mm_enabled.setChecked(False)
+        mm_opt_row.addWidget(self._mm_enabled)
+        mm_opt_row.addStretch()
+        mmg.addLayout(mm_opt_row)
+
+        mm_loc_row = QHBoxLayout()
+        mm_loc_row.addWidget(QLabel("Output folder:"))
+        self._mm_location = QComboBox()
+        self._mm_location.addItem("Subfolder inside output  →  …/Curvature+AO/",  "inside")
+        self._mm_location.addItem("Sibling of output (one level up)  →  ../Curvature+AO/", "sibling")
+        self._mm_location.setToolTip(
+            "Inside:  <your output path>/Curvature+AO/\n"
+            "Sibling: one folder above your output path, named Curvature+AO"
+        )
+        mm_loc_row.addWidget(self._mm_location, 1)
+        mmg.addLayout(mm_loc_row)
+
+        mm_btn_row = QHBoxLayout()
+        mm_now_btn = QPushButton("🗺  Export Curvature + AO Now")
+        mm_now_btn.setToolTip("Export mesh maps immediately without running the full skin batch.")
+        mm_now_btn.clicked.connect(self._export_mesh_maps_standalone)
+        mm_btn_row.addStretch(); mm_btn_row.addWidget(mm_now_btn)
+        mmg.addLayout(mm_btn_row)
+        lay.addWidget(mm_grp)
+
+
         cat_grp = QGroupBox("Export Categories"); catg = QHBoxLayout(cat_grp)
         cat_note = QLabel("Only checked categories will be exported:")
         cat_note.setStyleSheet("color:#aaa;font-size:11px;")
@@ -528,35 +703,6 @@ class TextureExporterWindow(QWidget):
         return scroll
 
     # =========================================================================
-    # ── Single-export helpers ─────────────────────────────────────────────────
-    # =========================================================================
-    def _refresh_presets(self):
-        self._s_preset.blockSignals(True); self._s_preset.clear(); self._preset_data.clear()
-        self._s_preset.addItem("★ Base Color  [custom]"); self._preset_data.append({"type": "inline"})
-        if substance_painter.project.is_open():
-            try:
-                for p in substance_painter.export.list_predefined_export_presets():
-                    self._s_preset.addItem(f"{p.name}  [predefined]")
-                    self._preset_data.append({"type": "predefined", "url": p.url})
-            except Exception as e: self._sp_log(f"Predefined presets: {e}", warn=True)
-            try:
-                for p in substance_painter.export.list_resource_export_presets():
-                    self._s_preset.addItem(f"{p.resource_id.name}  [shelf]")
-                    self._preset_data.append({"type": "resource", "url": p.resource_id.url()})
-            except Exception as e: self._sp_log(f"Resource presets: {e}", warn=True)
-        self._s_preset.blockSignals(False); self._s_preset.setCurrentIndex(0)
-
-    def _refresh_single_layers(self):
-        self._s_layer.clear()
-        if not substance_painter.project.is_open():
-            self._s_layer.addItem("(no project open)"); return
-        try:
-            stack = substance_painter.textureset.get_active_stack()
-            items = _walk_groups(stack)
-            if not items: self._s_layer.addItem("(no group layers found)"); return
-            for d, n in items: self._s_layer.addItem("  " * d + n.get_name(), n)
-        except Exception as e: self._s_layer.addItem(f"Error: {e}")
-
     # =========================================================================
     # ── Texture Set list (per-TS paths) ───────────────────────────────────────
     # =========================================================================
@@ -592,16 +738,33 @@ class TextureExporterWindow(QWidget):
                 row_lay.addWidget(path_edit)
 
                 browse_btn = QPushButton("…"); browse_btn.setFixedWidth(28)
-                browse_btn.clicked.connect(lambda _, pe=path_edit: self._browse(pe))
+                # PySide6's clicked signal emits a bool (checked state) as the first
+                # positional arg. We absorb it with `checked` so `pe` — captured via
+                # keyword default — is never overwritten. Same behaviour as the zero-arg
+                # `lambda:` used by the global Browse button, but loop-safe.
+                browse_btn.clicked.connect(lambda checked=False, pe=path_edit: self._browse(pe))
                 row_lay.addWidget(browse_btn)
 
                 self._ts_layout.addWidget(row_w)
-                self._ts_widgets[ts.name] = {"check": cb, "path": path_edit}
+                # NOTE: browse_btn MUST be stored here. In PySide6 the Python-level
+                # wrapper for a widget added to a layout can still be garbage-collected
+                # if no Python variable holds a reference. When that happens the
+                # clicked → lambda signal connection breaks silently. Keeping an
+                # explicit reference on self._ts_widgets prevents GC.
+                self._ts_widgets[ts.name] = {"check": cb, "path": path_edit, "browse": browse_btn}
 
             if not ts_list:
                 self._ts_layout.addWidget(QLabel("(no texture sets found)"))
         except Exception as e:
             self._ts_layout.addWidget(QLabel(f"Error: {e}"))
+
+        # ── Auto-populate the global default path from the project location ──
+        # Only fills in the field if it is currently blank, so any path the user
+        # has deliberately typed or browsed to is never overwritten.
+        if not self._b_path.text().strip():
+            default = self._get_project_default_path()
+            if default:
+                self._b_path.setText(default)
 
     def _selected_ts(self):
         """Return list of selected TextureSet objects."""
@@ -766,14 +929,14 @@ class TextureExporterWindow(QWidget):
         ts_checks = {name: w["check"].isChecked() for name, w in self._ts_widgets.items()}
         cfg = {
             "output_path":   self._b_path.text(),
-            "single_path":   self._s_path.text(),
             "format":        self._b_fmt.currentText(),
-            "single_format": self._s_fmt.currentText(),
             "worn_suffix":   self._b_worn_suffix.text(),
             "channels":      [k for k, cb in self._channel_checks.items() if cb.isChecked()],
             "categories":    [ct for ct, cb in self._cat_checks.items() if cb.isChecked()],
             "ts_paths":      ts_paths,
             "ts_checks":     ts_checks,
+            "mm_enabled":    self._mm_enabled.isChecked(),
+            "mm_location":   self._mm_location.currentData(),
             "ctx_fill_name":   (self._ctx_fill.currentData().get_name()       if self._ctx_fill.currentData()       else None),
             "ctx_wp_name":     (self._ctx_worn_paint.currentData().get_name() if self._ctx_worn_paint.currentData() else None),
             "ctx_bp_name":     (self._ctx_bp_group.currentData().get_name()   if self._ctx_bp_group.currentData()   else None),
@@ -790,10 +953,14 @@ class TextureExporterWindow(QWidget):
             with open(CONFIG_PATH) as f: cfg = json.load(f)
         except Exception: return
         if cfg.get("output_path"):   self._b_path.setText(cfg["output_path"])
-        if cfg.get("single_path"):   self._s_path.setText(cfg["single_path"])
+        # If config had no saved path, _refresh_ts_list will set the project-based default.
         if cfg.get("format") in self.FORMATS:        self._b_fmt.setCurrentText(cfg["format"])
-        if cfg.get("single_format") in self.FORMATS: self._s_fmt.setCurrentText(cfg["single_format"])
         if cfg.get("worn_suffix") is not None:       self._b_worn_suffix.setText(cfg["worn_suffix"])
+        if "mm_enabled" in cfg:
+            self._mm_enabled.setChecked(bool(cfg["mm_enabled"]))
+        if cfg.get("mm_location") in ("inside", "sibling"):
+            idx = 0 if cfg["mm_location"] == "inside" else 1
+            self._mm_location.setCurrentIndex(idx)
         if cfg.get("channels"):
             for key, cb in self._channel_checks.items(): cb.setChecked(key in cfg["channels"])
         if cfg.get("categories"):
@@ -833,6 +1000,106 @@ class TextureExporterWindow(QWidget):
     # =========================================================================
     # ── Shared helpers ────────────────────────────────────────────────────────
     # =========================================================================
+    def _get_project_default_path(self) -> str:
+        """
+        Return the best default output folder for the currently open project:
+          • <project_dir>/Textures  – if that subfolder already exists
+          • <project_dir>           – otherwise (never breaks if Textures is absent)
+          • ""                      – if no project is open or path cannot be determined
+        """
+        try:
+            if not substance_painter.project.is_open():
+                return ""
+            fp = substance_painter.project.file_path()
+            if not fp:
+                return ""
+            project_dir = os.path.dirname(os.path.abspath(fp))
+            textures_dir = os.path.join(project_dir, "Textures")
+            if os.path.isdir(textures_dir):
+                return textures_dir.replace("\\", "/")
+            return project_dir.replace("\\", "/")
+        except Exception:
+            return ""
+
+    def _set_all_ts_checked(self, state: bool):
+        """Check or uncheck all Texture Set rows."""
+        for w in self._ts_widgets.values():
+            w["check"].setChecked(state)
+
+    def _browse_default_and_find(self):
+        """
+        Browse for the global default output folder, then automatically fill
+        any EMPTY per-TS path fields whose TS name matches a subfolder under
+        the detected 'textures' root (same logic as 'Find Folders' but
+        non-destructive — never overwrites a path the user already set).
+        """
+        self._browse(self._b_path)
+        chosen = self._b_path.text().strip()
+        if chosen:
+            self._find_ts_folders(overwrite_existing=False)
+
+    def _find_ts_folders(self, overwrite_existing: bool = True):
+        """
+        Walk up from the current default output folder to find the 'textures'
+        root, then match each TS name to a subfolder inside it.
+
+        overwrite_existing=True  (manual button): sets ALL matched TS paths.
+        overwrite_existing=False (post-browse):   only fills EMPTY TS paths.
+        """
+        base = self._b_path.text().strip()
+        if not base:
+            if overwrite_existing:   # only nag when user clicked the button
+                QMessageBox.warning(self, "No Default Path",
+                    "Set a Default Output Folder first so the plugin knows\n"
+                    "where to start looking for a 'textures' folder.")
+            return
+
+        textures_root = _find_textures_root(base)
+        if textures_root is None:
+            if overwrite_existing:
+                QMessageBox.warning(self, "No 'textures' Folder Found",
+                    f"Could not find a folder named 'textures' (case-insensitive)\n"
+                    f"anywhere above:\n  {base}\n\n"
+                    f"Make sure the default output path is inside or equal to a\n"
+                    f"folder called 'textures'.")
+            return
+
+        # List immediate subfolders of the textures root
+        try:
+            subfolders = [
+                d for d in os.listdir(textures_root)
+                if os.path.isdir(os.path.join(textures_root, d))
+            ]
+        except Exception as e:
+            QMessageBox.warning(self, "Folder Error", f"Could not read {textures_root}:\n{e}")
+            return
+
+        if not subfolders:
+            if overwrite_existing:
+                QMessageBox.information(self, "No Subfolders",
+                    f"The textures folder has no subfolders:\n  {textures_root}")
+            return
+
+        matched = unmatched = 0
+        for ts_name, w in self._ts_widgets.items():
+            current_path = w["path"].text().strip()
+            if not overwrite_existing and current_path:
+                continue   # non-destructive pass — skip already-set paths
+
+            best = _find_best_folder_match(ts_name, subfolders)
+            if best:
+                full_path = (textures_root + "/" + best).replace("\\", "/")
+                w["path"].setText(full_path)
+                matched += 1
+            else:
+                unmatched += 1
+
+        if overwrite_existing:
+            msg = f"Matched {matched} / {len(self._ts_widgets)} Texture Sets to subfolders in:\n  {textures_root}"
+            if unmatched:
+                msg += f"\n\n{unmatched} TS(es) had no matching subfolder — their paths were not changed."
+            QMessageBox.information(self, "Find Folders — Done", msg)
+
     def _browse(self, target: QLineEdit):
         folder = QFileDialog.getExistingDirectory(
             self, "Choose Output Folder",
@@ -862,53 +1129,6 @@ class TextureExporterWindow(QWidget):
         sel = self._selected_ts()
         if sel: return sel[0].get_stack()
         return substance_painter.textureset.get_active_stack()
-
-    # =========================================================================
-    # ── Single export ─────────────────────────────────────────────────────────
-    # =========================================================================
-    def _single_export(self):
-        if not substance_painter.project.is_open():
-            QMessageBox.warning(self, "No Project", "Open a project first."); return
-        out = self._s_path.text().strip().replace("\\", "/")
-        if not out:
-            QMessageBox.warning(self, "No Folder", "Choose an output folder."); return
-        ts_list = substance_painter.textureset.all_texture_sets()
-        if not ts_list:
-            QMessageBox.warning(self, "No Texture Sets", "No texture sets found."); return
-        ts      = ts_list[0]
-        name    = self._s_layer.currentText().strip()
-        sp_fmt  = self.FORMATS[self._s_fmt.currentText()]
-        idx     = self._s_preset.currentIndex()
-        preset  = self._preset_data[idx] if idx < len(self._preset_data) else {"type": "inline"}
-
-        config  = {
-            "exportShaderParams": False, "exportPath": out,
-            "exportList": [{"rootPath": ts.name}],
-            "exportParameters": [{"parameters": {
-                "fileFormat": sp_fmt, "bitDepth": "16f" if sp_fmt == "exr" else "8",
-                "dithering": False, "paddingAlgorithm": "infinite", "dilationDistance": 16,
-            }}]
-        }
-        if preset["type"] == "inline":
-            config["exportPresets"] = [{"name": "SP", "maps": [{"fileName": name, "channels": [
-                {"destChannel": c, "srcChannel": c,
-                 "srcMapType": "documentMap", "srcMapName": "baseColor"} for c in ("R","G","B")
-            ]}]}]; config["defaultExportPreset"] = "SP"
-        else:
-            config["defaultExportPreset"] = preset["url"]
-
-        try:
-            r = substance_painter.export.export_project_textures(config)
-            if r.status == substance_painter.export.ExportStatus.Success:
-                n = sum(len(v) for v in r.textures.values())
-                self._s_status.setText(f"✅ Exported {n} file(s) → {out}")
-                self._save_config()
-            else:
-                self._s_status.setText(f"❌ {r.message}")
-                QMessageBox.critical(self, "Export Failed", r.message)
-        except Exception as e:
-            self._s_status.setText(f"❌ {e}")
-            QMessageBox.critical(self, "Error", str(e))
 
     # =========================================================================
     # ── Batch: detect ─────────────────────────────────────────────────────────
@@ -990,9 +1210,104 @@ class TextureExporterWindow(QWidget):
     def _request_cancel(self):
         self._cancel_requested = True
         self._b_cancel_btn.setEnabled(False)
+        self._b_cancel_btn_top.setEnabled(False)
         self._b_current.setText("Cancelling after current export…")
         # Force immediate UI update so the user sees feedback now
         QCoreApplication.processEvents()
+
+    # =========================================================================
+    # ── Mesh map (Curvature + AO) export ──────────────────────────────────────
+    # =========================================================================
+    def _export_mesh_maps(self, buckets: dict, sp_fmt: str) -> list:
+        """
+        Export curvature + AO baked mesh maps for every path bucket.
+        Returns a list of error strings (empty = all succeeded).
+
+        buckets : same dict used by _run_batch — {out_path: [TextureSet, …]}
+        sp_fmt  : SP format string e.g. "png"
+
+        Output folder per bucket:
+          "inside"  → <bucket_out_path>/Curvature+AO/
+          "sibling" → <parent_of_bucket_out_path>/Curvature+AO/
+        """
+        sibling  = (self._mm_location.currentData() == "sibling")
+        errors   = []
+
+        for out_path, ts_group in buckets.items():
+            if self._cancel_requested: break
+            mm_dir   = _resolve_meshmap_dir(out_path, sibling)
+            multi_ts = len(ts_group) > 1
+
+            # Create the output directory — never error if it already exists.
+            try:
+                os.makedirs(mm_dir, exist_ok=True)
+            except Exception as e:
+                msg = f"Could not create {mm_dir}: {e}"
+                self._blog(f"❌  [meshmap]  {msg}"); errors.append(msg); continue
+
+            ts_root_paths = [_ts_root_path(ts) for ts in ts_group]
+            config = build_meshmap_export_config(
+                ts_root_paths = ts_root_paths,
+                out_dir       = mm_dir,
+                sp_format     = sp_fmt,
+                multi_ts      = multi_ts,
+            )
+            try:
+                r = substance_painter.export.export_project_textures(config)
+                QCoreApplication.processEvents()
+                ES = substance_painter.export.ExportStatus
+                if r.status in (ES.Success, ES.Warning):
+                    n = sum(len(v) for v in r.textures.values())
+                    suffix = f" ⚠ {r.message}" if r.status == ES.Warning else ""
+                    self._blog(f"✅  [meshmap]  Curvature + AO → {mm_dir}  ({n} files){suffix}")
+                else:
+                    msg = f"{out_path}: {r.message}"
+                    self._blog(f"❌  [meshmap]  {msg}"); errors.append(msg)
+            except Exception as e:
+                QCoreApplication.processEvents()
+                msg = f"{out_path}: {e}"
+                self._blog(f"❌  [meshmap]  {msg}"); errors.append(msg)
+
+        return errors
+
+    def _export_mesh_maps_standalone(self):
+        """Standalone trigger — exports mesh maps without running the skin batch."""
+        if self._batch_running:
+            QMessageBox.warning(self, "Busy", "A batch export is already running."); return
+        if not substance_painter.project.is_open():
+            QMessageBox.warning(self, "No Project", "Open a project first."); return
+
+        sel_ts = self._selected_ts()
+        if not sel_ts:
+            QMessageBox.warning(self, "No Texture Sets", "Select at least one Texture Set."); return
+
+        buckets = self._ts_groups_by_path(sel_ts)
+        if "" in buckets:
+            missing = ", ".join(ts.name for ts in buckets[""])
+            QMessageBox.warning(self, "Missing Output Path",
+                f"No output path set for: {missing}"); return
+
+        sp_fmt  = self.FORMATS[self._b_fmt.currentText()]
+        sibling = (self._mm_location.currentData() == "sibling")
+        dirs    = [_resolve_meshmap_dir(p, sibling) for p in buckets]
+        reply   = QMessageBox.question(
+            self, "Export Curvature + AO",
+            f"Export baked Curvature + AO mesh maps to:\n"
+            + "\n".join(f"  {d}" for d in dirs)
+            + f"\n\nFormat: {sp_fmt.upper()}\nContinue?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes: return
+
+        self._b_log.append("─── Curvature + AO export ───")
+        errors = self._export_mesh_maps(buckets, sp_fmt)
+        if errors:
+            QMessageBox.warning(self, "Mesh Map Export — Errors",
+                f"{len(buckets) - len(errors)}/{len(buckets)} paths succeeded.\n"
+                f"Errors:\n" + "\n".join(errors))
+        else:
+            QMessageBox.information(self, "Mesh Map Export",
+                f"Curvature + AO exported to {len(buckets)} location(s).")
 
     # =========================================================================
     # ── Batch: run ────────────────────────────────────────────────────────────
@@ -1023,36 +1338,76 @@ class TextureExporterWindow(QWidget):
         if not enabled_cats:
             QMessageBox.warning(self, "No Categories", "Select at least one category (Normal / Worn / Bright)."); return
 
-        try:
-            stack = self._get_primary_stack()
-            root  = find_skin_pack_root(stack)
-        except Exception as e: QMessageBox.critical(self, "Error", str(e)); return
-        if root is None:
-            QMessageBox.critical(self, "Not Found",
-                "3-level skin pack structure not detected.\nUse 'Detect Structure' for details."); return
+        sp_fmt   = self.FORMATS[self._b_fmt.currentText()]
+        worn_sfx = self._b_worn_suffix.text()
+        # ctx from the UI pickers applies to the primary (first selected) stack
+        primary_ctx = self._ctx_nodes()
+        primary_stack = self._get_primary_stack()
 
-        all_jobs, all_skins, all_cats = build_export_jobs(root)
-        # Apply category filter
-        jobs = [j for j in all_jobs if j["cat_type"] in enabled_cats]
+        # ── Build per-stack visibility data for EVERY selected TS ────────────
+        # Each TS has its own independent layer stack. Skin layer toggles must be
+        # applied separately in every stack — touching only the primary stack is
+        # what caused all non-primary TSes to always export the default skin.
+        stack_infos     = []   # one entry per TS whose skin structure was found
+        missing_struct  = []
+        for ts in sel_ts:
+            try:
+                st = ts.get_stack()
+                r  = find_skin_pack_root(st)
+                if r is None:
+                    missing_struct.append(ts.name); continue
+                j_all, skins, cats = build_export_jobs(r)
+                j_filt = [jb for jb in j_all if jb["cat_type"] in enabled_cats]
+                # Use the user's manually chosen ctx pickers for the primary stack;
+                # auto-detect for every other stack so no manual setup is required.
+                if st is primary_stack:
+                    ctx_st = primary_ctx
+                else:
+                    auto = _auto_detect_ctx(st, r)
+                    fill = auto["fill"]; inv = wp = None
+                    if fill:
+                        try:
+                            for fx in fill.content_effects():
+                                if _is_filter_fx(fx): inv = fx; break
+                        except Exception: pass
+                        try:
+                            for fx in fill.mask_effects():
+                                if _is_paint_fx(fx): wp = fx; break
+                        except Exception: pass
+                    ctx_st = {"fill": fill, "invert": inv, "worn_paint": wp,
+                               "bp_group":   auto["bp_group"],
+                               "bp_nonworn": auto["bp_nonworn"],
+                               "bp_worn":    auto["bp_worn"]}
+                stack_infos.append({"ts": ts, "root": r, "jobs": j_filt,
+                                    "all_skins": skins, "all_cats": cats, "ctx": ctx_st})
+            except Exception as e:
+                self._sp_log(f"Stack setup for {ts.name}: {e}", warn=True)
+                missing_struct.append(ts.name)
+
+        if missing_struct:
+            QMessageBox.warning(self, "Missing Structure",
+                f"Skin pack structure not found in:\n{', '.join(missing_struct)}\n\n"
+                "Those Texture Sets will be skipped.")
+        if not stack_infos:
+            QMessageBox.critical(self, "No Valid Texture Sets",
+                "No selected Texture Set has a recognizable skin pack structure."); return
+
+        # Use the first valid stack's filtered job list as the canonical skin order
+        jobs = stack_infos[0]["jobs"]
         if not jobs:
             QMessageBox.warning(self, "No Jobs",
                 "No skins match the selected categories."); return
 
-        sp_fmt   = self.FORMATS[self._b_fmt.currentText()]
-        worn_sfx = self._b_worn_suffix.text()
-        ctx      = self._ctx_nodes()
-        total    = len(jobs)
-
-        # Confirm dialog
+        # ── Confirm dialog ────────────────────────────────────────────────────
         cat_str  = ", ".join(c.capitalize() for c in sorted(enabled_cats))
         ts_str   = ", ".join(ts.name for ts in sel_ts)
         ch_str   = ", ".join(CHANNEL_DEFS[k]["label"] for k in channels)
         path_str = "\n".join(f"  {p}  ({', '.join(t.name for t in tg)})"
                              for p, tg in buckets.items())
-        n_files  = total * sum(len(tg) for tg in buckets.values()) * len(channels)
+        n_files  = len(jobs) * sum(len(tg) for tg in buckets.values()) * len(channels)
         reply = QMessageBox.question(
             self, "Run Batch Export",
-            f"Export {total} skins\n\n"
+            f"Export {len(jobs)} skins\n\n"
             f"Categories   : {cat_str}\n"
             f"Texture Sets : {ts_str}\n"
             f"Channels     : {ch_str}\n"
@@ -1064,32 +1419,41 @@ class TextureExporterWindow(QWidget):
         if reply != QMessageBox.Yes: return
 
         # ── Setup ─────────────────────────────────────────────────────────────
+        # Progress tracks individual export calls: one per (skin × path-bucket).
+        # This matches what the user sees in the log and "160 files total" style counts.
+        total_ticks = len(jobs) * len(buckets)
         self._batch_running    = True
         self._cancel_requested = False
         self._b_run_btn.setEnabled(False)
         self._b_cancel_btn.setEnabled(True)
-        self._b_progress.setMaximum(total)
+        self._b_cancel_btn_top.setEnabled(True)
+        self._b_progress.setMaximum(total_ticks)
         self._b_progress.setValue(0)
         self._b_log.clear()
 
-        vis_nodes = (
-            [root] + all_cats + all_skins
-            + [n for n in [ctx["fill"], ctx["invert"], ctx["worn_paint"],
-                            ctx["bp_group"], ctx["bp_nonworn"], ctx["bp_worn"]]
-               if n is not None]
-        )
-        vis_state = _save_vis(vis_nodes)
-        errors = []
+        # Snapshot visibility for every node we'll touch across ALL stacks
+        all_vis_nodes = []
+        for si in stack_infos:
+            c = si["ctx"]
+            all_vis_nodes += [si["root"]] + si["all_cats"] + si["all_skins"]
+            all_vis_nodes += [n for n in [c["fill"], c["invert"], c["worn_paint"],
+                                           c["bp_group"], c["bp_nonworn"], c["bp_worn"]]
+                              if n is not None]
+        vis_state = _save_vis(all_vis_nodes)
+        errors    = []
+        tick_idx  = 0
 
         try:
-            root.set_visible(True)
-            for n in all_cats: n.set_visible(True)
-            if ctx["fill"]:     ctx["fill"].set_visible(True)
-            if ctx["bp_group"]: ctx["bp_group"].set_visible(True)
-            for n in all_skins: n.set_visible(False)
+            # Initialise every stack: root+cats visible, all skins hidden
+            for si in stack_infos:
+                si["root"].set_visible(True)
+                for n in si["all_cats"]: n.set_visible(True)
+                c = si["ctx"]
+                if c["fill"]:     c["fill"].set_visible(True)
+                if c["bp_group"]: c["bp_group"].set_visible(True)
+                for n in si["all_skins"]: n.set_visible(False)
 
             for idx, job in enumerate(jobs):
-                # ── Cancel check (reliable: runs before AND after each export) ──
                 if self._cancel_requested:
                     self._blog("⚠ Cancelled by user."); break
 
@@ -1097,13 +1461,20 @@ class TextureExporterWindow(QWidget):
                 if job["cat_type"] == "worn" and worn_sfx and "worn" not in name.lower():
                     name = name + worn_sfx
 
-                self._tick(idx, total, name)
-                self._apply_ctx(job["cat_type"], ctx)
-                for n in job["show"]: n.set_visible(True)
+                # Apply ctx toggles and show the correct skin in EVERY stack.
+                # si["jobs"][idx] gives the matching skin node(s) for that stack.
+                for si in stack_infos:
+                    self._apply_ctx(job["cat_type"], si["ctx"])
+                    si_job = si["jobs"][idx] if idx < len(si["jobs"]) else None
+                    if si_job:
+                        for n in si_job["show"]: n.set_visible(True)
 
-                # One export call per path bucket for this skin
+                # One export call per path bucket (visibility already correct in all stacks)
                 for out_path, ts_group in buckets.items():
-                    if self._cancel_requested: break   # ← also checked mid-bucket
+                    if self._cancel_requested: break
+
+                    tick_idx += 1
+                    self._tick(tick_idx, total_ticks, name)
 
                     ts_root_paths = [_ts_root_path(ts) for ts in ts_group]
                     multi_ts      = len(ts_group) > 1
@@ -1117,12 +1488,17 @@ class TextureExporterWindow(QWidget):
                     )
                     try:
                         r = substance_painter.export.export_project_textures(config)
-                        # ── Process events immediately after each export so cancel
-                        #    button clicks register without waiting for the next tick ──
+                        # Process events immediately after each export call so the
+                        # cancel button click registers without waiting for the next tick
                         QCoreApplication.processEvents()
-                        if r.status == substance_painter.export.ExportStatus.Success:
+                        ES = substance_painter.export.ExportStatus
+                        if r.status in (ES.Success, ES.Warning):
+                            # Warning = completed with warnings but files were written.
+                            # Per 12.1.0 docs: status can never be Error from this call;
+                            # errors raise exceptions instead. Treat Warning as success.
                             n_files = sum(len(v) for v in r.textures.values())
-                            self._blog(f"✅  [{job['cat_type']:6}]  {name}  → {out_path}  ({n_files} files)")
+                            suffix  = f" ⚠ {r.message}" if r.status == ES.Warning else ""
+                            self._blog(f"✅  [{job['cat_type']:6}]  {name}  → {out_path}  ({n_files} files){suffix}")
                         else:
                             self._blog(f"❌  [{job['cat_type']:6}]  {name}  → {out_path}: {r.message}")
                             errors.append(name)
@@ -1131,29 +1507,51 @@ class TextureExporterWindow(QWidget):
                         self._blog(f"❌  [{job['cat_type']:6}]  {name}  → {out_path}: {e}")
                         errors.append(name)
 
-                for n in job["show"]: n.set_visible(False)
+                # Hide the skin in every stack before moving on
+                for si in stack_infos:
+                    si_job = si["jobs"][idx] if idx < len(si["jobs"]) else None
+                    if si_job:
+                        for n in si_job["show"]: n.set_visible(False)
 
-            if not self._cancel_requested: self._tick(total, total, "Done")
+            if not self._cancel_requested: self._tick(total_ticks, total_ticks, "Done")
 
         finally:
             _restore_vis(vis_state)
             self._batch_running = False
             self._b_run_btn.setEnabled(True)
             self._b_cancel_btn.setEnabled(False)
+            self._b_cancel_btn_top.setEnabled(False)
             self._save_config()
 
-        ok        = total - len(errors)
+        n_skins   = len(jobs)
+        ok        = n_skins - len(set(errors))   # unique skin names that had any failure
         cancelled = self._cancel_requested
-        status    = f"{'Cancelled — ' if cancelled else ''}Complete — {ok}/{total} succeeded"
-        if errors: status += f", {len(errors)} failed"
+        status    = f"{'Cancelled — ' if cancelled else ''}Complete — {ok}/{n_skins} skins exported"
+        if errors: status += f", {len(set(errors))} failed"
         self._b_current.setText(status)
+
+        # ── Auto-run mesh map export if enabled and batch wasn't cancelled ────
+        mm_errors = []
+        if self._mm_enabled.isChecked() and not cancelled:
+            self._b_log.append("─── Curvature + AO export ───")
+            self._b_current.setText("Exporting Curvature + AO mesh maps…")
+            QCoreApplication.processEvents()
+            mm_errors = self._export_mesh_maps(buckets, sp_fmt)
+            self._b_current.setText(status)
 
         if errors:
             QMessageBox.warning(self, "Batch Complete with Errors",
-                                f"{ok} exported.\nFailed: {', '.join(dict.fromkeys(errors))}")
+                                f"{ok}/{n_skins} skins exported.\n"
+                                f"Failed: {', '.join(dict.fromkeys(errors))}"
+                                + (f"\n\nMesh map errors:\n" + "\n".join(mm_errors) if mm_errors else ""))
+        elif mm_errors:
+            QMessageBox.warning(self, "Batch Complete — Mesh Map Errors",
+                                f"All {ok} skins exported.\n\n"
+                                f"Curvature + AO export failed:\n" + "\n".join(mm_errors))
         elif not cancelled:
+            mm_note = "\nCurvature + AO mesh maps also exported." if self._mm_enabled.isChecked() else ""
             QMessageBox.information(self, "Batch Complete",
-                                    f"All {ok} skins exported.")
+                                    f"All {ok} skins exported successfully.{mm_note}")
 
     # ── Window close → hide ───────────────────────────────────────────────────
     def closeEvent(self, event):
@@ -1189,8 +1587,6 @@ def close_plugin():
 def _show_window():
     if _window:
         _window.show(); _window.raise_(); _window.activateWindow()
-        _window._refresh_presets()
-        _window._refresh_single_layers()
         _window._refresh_ts_list()
         _window._apply_saved_ts_data()
         _window._refresh_ctx_pickers()
