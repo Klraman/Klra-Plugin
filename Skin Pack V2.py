@@ -1,6 +1,22 @@
 """
-Texture Exporter – v6
-Substance Painter 12.1.0  |  PySide6
+Texture Exporter – v7
+Substance Painter 12.1.3  |  PySide6
+
+v7 changes:
+  1. Misc Export replaces Curvature + AO:
+     - Renamed target folder from Curvature+AO to Misc (inside or sibling).
+     - Exports 4 files per Texture Set when toggled:
+         • AO_<TextureSet>                (meshMap: ambient_occlusion)
+         • Curvature_<TextureSet>         (meshMap: curvature)
+         • Overlay_Text_<TextureSet>      (documentMap: baseColor)
+         • Overlay_Engraving_<TextureSet> (documentMap: baseColor)
+  2. Overlay selection & soloing:
+     - Added Engraving Layer/Folder picker (_ctx_engraving) supporting both Fill layers and Folders.
+     - Auto-detection looks for layers/folders containing 'engrav' with manual dropdown override.
+     - Contextual auto-detection now resolves matching Text and Engraving layers across multi-TS stacks.
+     - Isolated/solo visibility when exporting Text and Engraving overlays, restoring scene state safely.
+  3. Filename convention updated:
+     - Added texture set name directly to all misc export files (e.g. AO_Barrel, Curvature_Barrel, Overlay_Text_Barrel, Overlay_Engraving_Barrel).
 
 v6 changes:
   1. Select All / Select None checkboxes for Texture Sets.
@@ -316,30 +332,29 @@ def build_meshmap_export_config(
     ts_root_paths: list,
     out_dir: str,
     sp_format: str,
-    multi_ts: bool,
+    multi_ts: bool = True,
 ) -> dict:
     """
     Export curvature and AO baked mesh maps (srcMapType: "meshMap").
     These are baked per-mesh and do NOT change with skin layer visibility,
     so they are exported once per texture set — never once per skin.
 
-    srcMapName values per 12.1.0 docs:
+    srcMapName values per 12.1.3 docs:
       "curvature"         → curvature mesh map
       "ambient_occlusion" → ambient occlusion mesh map
 
-    Filename scheme mirrors build_export_config:
-      1 TS  → {Curvature|AO}
-      N TSes → $textureSet_{Curvature|AO}
+    Filename scheme:
+      AO_$textureSet and Curvature_$textureSet
+      e.g. AO_Barrel, Curvature_Barrel
     """
-    prefix = "$textureSet_" if multi_ts else ""
     maps = [
         {
-            "fileName": f"{prefix}Curvature",
+            "fileName": "Curvature_$textureSet",
             "channels": [{"destChannel": "L", "srcChannel": "L",
                           "srcMapType": "meshMap", "srcMapName": "curvature"}],
         },
         {
-            "fileName": f"{prefix}AO",
+            "fileName": "AO_$textureSet",
             "channels": [{"destChannel": "L", "srcChannel": "L",
                           "srcMapType": "meshMap", "srcMapName": "ambient_occlusion"}],
         },
@@ -347,12 +362,45 @@ def build_meshmap_export_config(
     return {
         "exportShaderParams": False,
         "exportPath":         out_dir,
-        "exportPresets":      [{"name": "MeshMaps", "maps": maps}],
-        "defaultExportPreset": "MeshMaps",
+        "exportPresets":      [{"name": "MiscMeshMaps", "maps": maps}],
+        "defaultExportPreset": "MiscMeshMaps",
         "exportList":         [{"rootPath": rp} for rp in ts_root_paths],
         "exportParameters":   [{"parameters": {
             "fileFormat":       sp_format,
             "bitDepth":         "8",   # baked maps are always 8-bit
+            "dithering":        False,
+            "paddingAlgorithm": "infinite",
+            "dilationDistance": 16,
+        }}],
+    }
+
+
+def build_overlay_export_config(
+    ts_root_paths: list,
+    out_dir: str,
+    sp_format: str,
+    map_fileName: str,
+) -> dict:
+    """
+    Export an isolated overlay (Text or Engraving) as a Base Color document map.
+    map_fileName uses the $textureSet wildcard, e.g. "Overlay_Text_$textureSet"
+    or "Overlay_Engraving_$textureSet".
+    """
+    channels = [
+        {"destChannel": c, "srcChannel": c,
+         "srcMapType": "documentMap", "srcMapName": "baseColor"}
+        for c in ("R", "G", "B")
+    ]
+    maps = [{"fileName": map_fileName, "channels": channels}]
+    return {
+        "exportShaderParams": False,
+        "exportPath":         out_dir,
+        "exportPresets":      [{"name": "MiscOverlay", "maps": maps}],
+        "defaultExportPreset": "MiscOverlay",
+        "exportList":         [{"rootPath": rp} for rp in ts_root_paths],
+        "exportParameters":   [{"parameters": {
+            "fileFormat":       sp_format,
+            "bitDepth":         "8",
             "dithering":        False,
             "paddingAlgorithm": "infinite",
             "dilationDistance": 16,
@@ -378,15 +426,18 @@ def _find_textures_root(path: str) -> str | None:
         p = parent
 
 
-def _resolve_meshmap_dir(base_path: str, sibling: bool) -> str:
+def _resolve_misc_dir(base_path: str, sibling: bool) -> str:
     """
-    Return the Curvature+AO output folder path.
-      sibling=False → <base_path>/Curvature+AO
-      sibling=True  → <parent_of_base_path>/Curvature+AO
+    Return the Misc output folder path.
+      sibling=False → <base_path>/Misc
+      sibling=True  → <parent_of_base_path>/Misc
     """
     base   = base_path.rstrip("/").rstrip("\\")
     parent = os.path.dirname(base) if sibling else base
-    return (parent + "/Curvature+AO").replace("\\", "/")
+    return (parent + "/Misc").replace("\\", "/")
+
+
+_resolve_meshmap_dir = _resolve_misc_dir  # Backward-compatible alias
 
 
 # ── Deep folder-matching helpers ──────────────────────────────────────────────
@@ -469,7 +520,7 @@ def _find_best_deep_match(ts_name: str, all_folders: list) -> tuple:
 
 
 def _auto_detect_ctx(stack, skin_root):
-    result = {"fill": None, "bp_group": None, "bp_nonworn": None, "bp_worn": None}
+    result = {"fill": None, "bp_group": None, "bp_nonworn": None, "bp_worn": None, "engraving": None}
     best = fallback = None
     for _, node in _walk_fills(stack):
         try:
@@ -480,10 +531,21 @@ def _auto_detect_ctx(stack, skin_root):
         if has_f and not fallback: fallback = node
     result["fill"] = best or fallback
 
+    # ── Auto-detect engraving (fill layer or folder containing 'engrav') ─────
+    try:
+        for _, node in _walk_all(stack):
+            if skin_root is not None and node is skin_root: continue
+            if result["fill"] is not None and node is result["fill"]: continue
+            if "engrav" in node.get_name().lower():
+                result["engraving"] = node
+                break
+    except Exception: pass
+
     try:
         for node in sp_ls.get_root_layer_nodes(stack):
             if not _is_group(node): continue
             if skin_root is not None and node is skin_root: continue
+            if result["engraving"] is not None and node is result["engraving"]: continue
             children = [c for c in node.sub_layers() if _is_proper_layer(c)]
             if len(children) < 2:
                 continue
@@ -659,16 +721,16 @@ class TextureExporterWindow(QWidget):
             cg.addWidget(cb, 1 + i // 3, i % 3)
         lay.addWidget(ch_grp)
 
-        # ── Curvature + AO export ─────────────────────────────────────────────
-        mm_grp = QGroupBox("Curvature + AO Export"); mmg = QVBoxLayout(mm_grp); mmg.setSpacing(6)
+        # ── Misc export (AO, Curvature, Text & Engraving Overlays) ────────────
+        mm_grp = QGroupBox("Misc Export"); mmg = QVBoxLayout(mm_grp); mmg.setSpacing(6)
         mm_note = QLabel(
-            "Exports the baked Curvature and AO mesh maps once per Texture Set "
-            "(not per-skin). Uses the same format as the batch above."
+            "Exports AO, Curvature, Text Overlay, and Engraving Overlay (4 files) once per Texture Set "
+            "(not per-skin). Overlays use the Text and Engraving layers configured below."
         )
         mm_note.setWordWrap(True); mm_note.setStyleSheet("color:#aaa;font-size:11px;"); mmg.addWidget(mm_note)
 
         mm_opt_row = QHBoxLayout()
-        self._mm_enabled = QCheckBox("Run automatically after batch")
+        self._mm_enabled = QCheckBox("Run automatically after batch (AO, Curvature & Overlays)")
         self._mm_enabled.setChecked(False)
         mm_opt_row.addWidget(self._mm_enabled)
         mm_opt_row.addStretch()
@@ -677,19 +739,19 @@ class TextureExporterWindow(QWidget):
         mm_loc_row = QHBoxLayout()
         mm_loc_row.addWidget(QLabel("Output folder:"))
         self._mm_location = QComboBox()
-        self._mm_location.addItem("Subfolder inside output  →  …/Curvature+AO/",  "inside")
-        self._mm_location.addItem("Sibling of output (one level up)  →  ../Curvature+AO/", "sibling")
+        self._mm_location.addItem("Subfolder inside output  →  …/Misc/",  "inside")
+        self._mm_location.addItem("Sibling of output (one level up)  →  ../Misc/", "sibling")
         self._mm_location.setToolTip(
-            "Inside:  <your output path>/Curvature+AO/\n"
-            "Sibling: one folder above your output path, named Curvature+AO"
+            "Inside:  <your output path>/Misc/\n"
+            "Sibling: one folder above your output path, named Misc"
         )
         mm_loc_row.addWidget(self._mm_location, 1)
         mmg.addLayout(mm_loc_row)
 
         mm_btn_row = QHBoxLayout()
-        mm_now_btn = QPushButton("🗺  Export Curvature + AO Now")
-        mm_now_btn.setToolTip("Export mesh maps immediately without running the full skin batch.")
-        mm_now_btn.clicked.connect(self._export_mesh_maps_standalone)
+        mm_now_btn = QPushButton("🗺  Export Misc Maps Now")
+        mm_now_btn.setToolTip("Export Misc maps (AO, Curvature, Text & Engraving overlays) immediately without running the full skin batch.")
+        mm_now_btn.clicked.connect(self._export_misc_maps_standalone)
         mm_btn_row.addStretch(); mm_btn_row.addWidget(mm_now_btn)
         mmg.addLayout(mm_btn_row)
         lay.addWidget(mm_grp)
@@ -722,6 +784,7 @@ class TextureExporterWindow(QWidget):
             if tip: c.setToolTip(tip)
             setattr(self, attr, c); r.addWidget(c); ctg.addLayout(r)
         _crow("Text Fill Layer:",        "_ctx_fill",     "FillLayerNode with Invert filter in content_effects().")
+        _crow("Engraving Layer/Folder:", "_ctx_engraving","FillLayerNode or GroupLayerNode containing engravings/markings.")
         _crow("Worn Paint Layer:",       "_ctx_worn_paint","PaintEffectNode in fill layer's mask_effects(). Auto-populated.")
         _crow("Black Parts Group:",      "_ctx_bp_group", "GroupLayerNode containing non-worn and worn child layers.")
         _crow("Black Parts — Non-Worn:", "_ctx_bp_nonworn","Visible for Normal and Bright exports.")
@@ -906,6 +969,7 @@ class TextureExporterWindow(QWidget):
             skin_root = find_skin_pack_root(stack)
             auto      = _auto_detect_ctx(stack, skin_root)
             self._populate_fill_picker(stack, auto["fill"])
+            self._populate_engraving_picker(stack, auto["engraving"])
             self._populate_bp_group_picker(stack, skin_root, auto["bp_group"])
             self._auto_select_bp_children(auto["bp_nonworn"], auto["bp_worn"])
             self._try_restore_ctx_by_name()
@@ -919,6 +983,28 @@ class TextureExporterWindow(QWidget):
             if auto_select is n: best = i + 1
         self._ctx_fill.blockSignals(False); self._ctx_fill.setCurrentIndex(best)
         self._populate_worn_paint_picker(auto_first=(best > 0))
+
+    def _populate_engraving_picker(self, stack, auto_select=None):
+        self._ctx_engraving.blockSignals(True)
+        self._ctx_engraving.clear()
+        self._ctx_engraving.addItem("— none —", None)
+        best = 0
+        idx = 0
+        for d, n in _walk_all(stack):
+            if _is_group(n):
+                idx += 1
+                self._ctx_engraving.addItem("  " * d + f"📁 {n.get_name()}", n)
+                if auto_select is n: best = idx
+            elif _is_fill(n):
+                idx += 1
+                self._ctx_engraving.addItem("  " * d + f"📄 {n.get_name()}", n)
+                if auto_select is n: best = idx
+            elif _is_proper_layer(n):
+                idx += 1
+                self._ctx_engraving.addItem("  " * d + f"🎨 {n.get_name()}", n)
+                if auto_select is n: best = idx
+        self._ctx_engraving.blockSignals(False)
+        self._ctx_engraving.setCurrentIndex(best)
 
     def _populate_worn_paint_picker(self, auto_first=False):
         self._ctx_worn_paint.blockSignals(True); self._ctx_worn_paint.clear(); self._ctx_worn_paint.addItem("— none —", None)
@@ -976,7 +1062,8 @@ class TextureExporterWindow(QWidget):
                 "worn_paint": self._ctx_worn_paint.currentData(),
                 "bp_group":   self._ctx_bp_group.currentData(),
                 "bp_nonworn": self._ctx_bp_nonworn.currentData(),
-                "bp_worn":    self._ctx_bp_worn.currentData()}
+                "bp_worn":    self._ctx_bp_worn.currentData(),
+                "engraving":  self._ctx_engraving.currentData()}
 
     def _apply_ctx(self, cat_type: str, ctx: dict):
         """
@@ -1010,13 +1097,14 @@ class TextureExporterWindow(QWidget):
             "categories":    [ct for ct, cb in self._cat_checks.items() if cb.isChecked()],
             "ts_paths":      ts_paths,
             "ts_checks":     ts_checks,
-            "mm_enabled":    self._mm_enabled.isChecked(),
-            "mm_location":   self._mm_location.currentData(),
-            "ctx_fill_name":   (self._ctx_fill.currentData().get_name()       if self._ctx_fill.currentData()       else None),
-            "ctx_wp_name":     (self._ctx_worn_paint.currentData().get_name() if self._ctx_worn_paint.currentData() else None),
-            "ctx_bp_name":     (self._ctx_bp_group.currentData().get_name()   if self._ctx_bp_group.currentData()   else None),
-            "ctx_bpnw_name":   (self._ctx_bp_nonworn.currentData().get_name() if self._ctx_bp_nonworn.currentData() else None),
-            "ctx_bpw_name":    (self._ctx_bp_worn.currentData().get_name()    if self._ctx_bp_worn.currentData()    else None),
+            "mm_enabled":         self._mm_enabled.isChecked(),
+            "mm_location":        self._mm_location.currentData(),
+            "ctx_fill_name":      (self._ctx_fill.currentData().get_name()       if self._ctx_fill.currentData()       else None),
+            "ctx_engraving_name": (self._ctx_engraving.currentData().get_name()  if self._ctx_engraving.currentData()  else None),
+            "ctx_wp_name":        (self._ctx_worn_paint.currentData().get_name() if self._ctx_worn_paint.currentData() else None),
+            "ctx_bp_name":        (self._ctx_bp_group.currentData().get_name()   if self._ctx_bp_group.currentData()   else None),
+            "ctx_bpnw_name":      (self._ctx_bp_nonworn.currentData().get_name() if self._ctx_bp_nonworn.currentData() else None),
+            "ctx_bpw_name":       (self._ctx_bp_worn.currentData().get_name()    if self._ctx_bp_worn.currentData()    else None),
         }
         try:
             with open(CONFIG_PATH, "w") as f: json.dump(cfg, f, indent=2)
@@ -1044,9 +1132,12 @@ class TextureExporterWindow(QWidget):
         self._saved_ts_paths  = cfg.get("ts_paths", {})
         self._saved_ts_checks = cfg.get("ts_checks", {})
         self._saved_ctx = {
-            "fill": cfg.get("ctx_fill_name"),   "wp":   cfg.get("ctx_wp_name"),
-            "bp":   cfg.get("ctx_bp_name"),     "bpnw": cfg.get("ctx_bpnw_name"),
-            "bpw":  cfg.get("ctx_bpw_name"),
+            "fill":      cfg.get("ctx_fill_name"),
+            "engraving": cfg.get("ctx_engraving_name"),
+            "wp":        cfg.get("ctx_wp_name"),
+            "bp":        cfg.get("ctx_bp_name"),
+            "bpnw":      cfg.get("ctx_bpnw_name"),
+            "bpw":       cfg.get("ctx_bpw_name"),
         }
 
     def _try_restore_ctx_by_name(self):
@@ -1057,6 +1148,7 @@ class TextureExporterWindow(QWidget):
                 d = combo.itemData(i)
                 if d is not None and d.get_name() == name: combo.setCurrentIndex(i); return
         _match(self._ctx_fill,      saved.get("fill"))
+        _match(self._ctx_engraving, saved.get("engraving"))
         _match(self._ctx_worn_paint, saved.get("wp"))
         _match(self._ctx_bp_group,  saved.get("bp"))
         _match(self._ctx_bp_nonworn, saved.get("bpnw"))
@@ -1350,62 +1442,232 @@ class TextureExporterWindow(QWidget):
         QCoreApplication.processEvents()
 
     # =========================================================================
-    # ── Mesh map (Curvature + AO) export ──────────────────────────────────────
     # =========================================================================
-    def _export_mesh_maps(self, buckets: dict, sp_fmt: str) -> list:
+    # ── Misc (AO, Curvature, Text & Engraving Overlays) export ───────────────
+    # =========================================================================
+    def _export_misc_maps(self, buckets: dict, sp_fmt: str, stack_infos_by_ts: dict = None) -> list:
         """
-        Export curvature + AO baked mesh maps for every path bucket.
-        Returns a list of error strings (empty = all succeeded).
+        Export Misc files for every path bucket:
+          1. Curvature + AO baked mesh maps (2 files)
+             → Curvature_<TextureSet> and AO_<TextureSet>
+          2. Text Overlay baseColor document map (1 file)
+             → Overlay_Text_<TextureSet>
+          3. Engraving Overlay baseColor document map (1 file)
+             → Overlay_Engraving_<TextureSet>
+          Total: 4 files per Texture Set.
 
-        buckets : same dict used by _run_batch — {out_path: [TextureSet, …]}
+        buckets : dict {out_path: [TextureSet, …]}
         sp_fmt  : SP format string e.g. "png"
-
-        Output folder per bucket:
-          "inside"  → <bucket_out_path>/Curvature+AO/
-          "sibling" → <parent_of_bucket_out_path>/Curvature+AO/
+        stack_infos_by_ts : optional dict {ts.name: stack_info}
         """
-        sibling  = (self._mm_location.currentData() == "sibling")
-        errors   = []
+        sibling = (self._mm_location.currentData() == "sibling")
+        errors = []
+
+        primary_ctx = self._ctx_nodes()
+        primary_stack = self._get_primary_stack()
 
         for out_path, ts_group in buckets.items():
             if self._cancel_requested: break
-            mm_dir   = _resolve_meshmap_dir(out_path, sibling)
-            multi_ts = len(ts_group) > 1
+            misc_dir = _resolve_misc_dir(out_path, sibling)
 
-            # Create the output directory — never error if it already exists.
             try:
-                os.makedirs(mm_dir, exist_ok=True)
+                os.makedirs(misc_dir, exist_ok=True)
             except Exception as e:
-                msg = f"Could not create {mm_dir}: {e}"
-                self._blog(f"❌  [meshmap]  {msg}"); errors.append(msg); continue
+                msg = f"Could not create {misc_dir}: {e}"
+                self._blog(f"❌  [misc]  {msg}"); errors.append(msg); continue
 
+            # ── 1. Export Mesh Maps (AO & Curvature) ──────────────────────────
             ts_root_paths = [_ts_root_path(ts) for ts in ts_group]
-            config = build_meshmap_export_config(
+            config_mesh = build_meshmap_export_config(
                 ts_root_paths = ts_root_paths,
-                out_dir       = mm_dir,
+                out_dir       = misc_dir,
                 sp_format     = sp_fmt,
-                multi_ts      = multi_ts,
+                multi_ts      = True,
             )
             try:
-                r = substance_painter.export.export_project_textures(config)
+                r = substance_painter.export.export_project_textures(config_mesh)
                 QCoreApplication.processEvents()
                 ES = substance_painter.export.ExportStatus
                 if r.status in (ES.Success, ES.Warning):
                     n = sum(len(v) for v in r.textures.values())
                     suffix = f" ⚠ {r.message}" if r.status == ES.Warning else ""
-                    self._blog(f"✅  [meshmap]  Curvature + AO → {mm_dir}  ({n} files){suffix}")
+                    self._blog(f"✅  [misc]  AO + Curvature → {misc_dir}  ({n} files){suffix}")
                 else:
-                    msg = f"{out_path}: {r.message}"
-                    self._blog(f"❌  [meshmap]  {msg}"); errors.append(msg)
+                    msg = f"{out_path} (mesh maps): {r.message}"
+                    self._blog(f"❌  [misc]  {msg}"); errors.append(msg)
             except Exception as e:
                 QCoreApplication.processEvents()
-                msg = f"{out_path}: {e}"
-                self._blog(f"❌  [meshmap]  {msg}"); errors.append(msg)
+                msg = f"{out_path} (mesh maps): {e}"
+                self._blog(f"❌  [misc]  {msg}"); errors.append(msg)
+
+            if self._cancel_requested: break
+
+            # ── Resolve stack ctx and roots for each TS in this group ─────────
+            ts_data = []
+            touched_nodes = set()
+            for ts in ts_group:
+                try:
+                    st = ts.get_stack()
+                    r = find_skin_pack_root(st)
+                    if r is not None: touched_nodes.add(r)
+                    if stack_infos_by_ts and ts.name in stack_infos_by_ts:
+                        ctx = stack_infos_by_ts[ts.name]["ctx"]
+                    elif st is primary_stack:
+                        ctx = primary_ctx
+                    else:
+                        auto = _auto_detect_ctx(st, r)
+                        f_node = None
+                        if primary_ctx.get("fill"):
+                            tname = primary_ctx["fill"].get_name()
+                            for _, fn in _walk_fills(st):
+                                if fn.get_name() == tname: f_node = fn; break
+                        if not f_node: f_node = auto["fill"]
+                        inv = wp = None
+                        if f_node:
+                            try:
+                                for fx in f_node.content_effects():
+                                    if _is_filter_fx(fx): inv = fx; break
+                            except Exception: pass
+                            try:
+                                for fx in f_node.mask_effects():
+                                    if _is_paint_fx(fx): wp = fx; break
+                            except Exception: pass
+                        e_node = None
+                        if primary_ctx.get("engraving"):
+                            tname = primary_ctx["engraving"].get_name()
+                            for _, en in _walk_all(st):
+                                if en.get_name() == tname: e_node = en; break
+                        if not e_node: e_node = auto["engraving"]
+                        ctx = {"fill": f_node, "invert": inv, "worn_paint": wp,
+                               "bp_group": auto["bp_group"], "bp_nonworn": auto["bp_nonworn"],
+                               "bp_worn": auto["bp_worn"], "engraving": e_node}
+
+                    for k in ("fill", "invert", "worn_paint", "bp_group", "engraving"):
+                        node = ctx.get(k)
+                        if node is not None:
+                            touched_nodes.add(node)
+                            p = node.get_parent()
+                            while p is not None:
+                                touched_nodes.add(p)
+                                p = p.get_parent()
+
+                    ts_data.append({"ts": ts, "stack": st, "root": r, "ctx": ctx})
+                except Exception as e:
+                    self._sp_log(f"Misc export ctx setup for {ts.name}: {e}", warn=True)
+
+            vis_state = _save_vis(touched_nodes)
+            try:
+                # ── 2. Export Text Overlay ────────────────────────────────────
+                ts_with_text = [d for d in ts_data if d["ctx"].get("fill") is not None]
+                if ts_with_text and not self._cancel_requested:
+                    for d in ts_data:
+                        ctx = d["ctx"]
+                        r   = d["root"]
+                        if r is not None:
+                            try: r.set_visible(False)
+                            except Exception: pass
+                        if ctx.get("bp_group") is not None:
+                            try: ctx["bp_group"].set_visible(False)
+                            except Exception: pass
+                        if ctx.get("engraving") is not None:
+                            try: ctx["engraving"].set_visible(False)
+                            except Exception: pass
+                        f = ctx.get("fill")
+                        if f is not None:
+                            try: f.set_visible(True)
+                            except Exception: pass
+                            p = f.get_parent()
+                            while p is not None:
+                                try: p.set_visible(True)
+                                except Exception: pass
+                                p = p.get_parent()
+                            if ctx.get("invert") is not None:
+                                try: ctx["invert"].set_visible(True)
+                                except Exception: pass
+                            if ctx.get("worn_paint") is not None:
+                                try: ctx["worn_paint"].set_visible(False)
+                                except Exception: pass
+
+                    config_text = build_overlay_export_config(
+                        ts_root_paths = [_ts_root_path(d["ts"]) for d in ts_with_text],
+                        out_dir       = misc_dir,
+                        sp_format     = sp_fmt,
+                        map_fileName  = "Overlay_Text_$textureSet",
+                    )
+                    try:
+                        r = substance_painter.export.export_project_textures(config_text)
+                        QCoreApplication.processEvents()
+                        ES = substance_painter.export.ExportStatus
+                        if r.status in (ES.Success, ES.Warning):
+                            n = sum(len(v) for v in r.textures.values())
+                            suffix = f" ⚠ {r.message}" if r.status == ES.Warning else ""
+                            self._blog(f"✅  [misc]  Overlay Text → {misc_dir}  ({n} files){suffix}")
+                        else:
+                            msg = f"{out_path} (Text overlay): {r.message}"
+                            self._blog(f"❌  [misc]  {msg}"); errors.append(msg)
+                    except Exception as e:
+                        QCoreApplication.processEvents()
+                        msg = f"{out_path} (Text overlay): {e}"
+                        self._blog(f"❌  [misc]  {msg}"); errors.append(msg)
+
+                if self._cancel_requested: break
+
+                # ── 3. Export Engraving Overlay ───────────────────────────────
+                ts_with_eng = [d for d in ts_data if d["ctx"].get("engraving") is not None]
+                if ts_with_eng and not self._cancel_requested:
+                    for d in ts_data:
+                        ctx = d["ctx"]
+                        r   = d["root"]
+                        if r is not None:
+                            try: r.set_visible(False)
+                            except Exception: pass
+                        if ctx.get("bp_group") is not None:
+                            try: ctx["bp_group"].set_visible(False)
+                            except Exception: pass
+                        if ctx.get("fill") is not None:
+                            try: ctx["fill"].set_visible(False)
+                            except Exception: pass
+                        eng = ctx.get("engraving")
+                        if eng is not None:
+                            try: eng.set_visible(True)
+                            except Exception: pass
+                            p = eng.get_parent()
+                            while p is not None:
+                                try: p.set_visible(True)
+                                except Exception: pass
+                                p = p.get_parent()
+
+                    config_eng = build_overlay_export_config(
+                        ts_root_paths = [_ts_root_path(d["ts"]) for d in ts_with_eng],
+                        out_dir       = misc_dir,
+                        sp_format     = sp_fmt,
+                        map_fileName  = "Overlay_Engraving_$textureSet",
+                    )
+                    try:
+                        r = substance_painter.export.export_project_textures(config_eng)
+                        QCoreApplication.processEvents()
+                        ES = substance_painter.export.ExportStatus
+                        if r.status in (ES.Success, ES.Warning):
+                            n = sum(len(v) for v in r.textures.values())
+                            suffix = f" ⚠ {r.message}" if r.status == ES.Warning else ""
+                            self._blog(f"✅  [misc]  Overlay Engraving → {misc_dir}  ({n} files){suffix}")
+                        else:
+                            msg = f"{out_path} (Engraving overlay): {r.message}"
+                            self._blog(f"❌  [misc]  {msg}"); errors.append(msg)
+                    except Exception as e:
+                        QCoreApplication.processEvents()
+                        msg = f"{out_path} (Engraving overlay): {e}"
+                        self._blog(f"❌  [misc]  {msg}"); errors.append(msg)
+
+            finally:
+                _restore_vis(vis_state)
 
         return errors
 
-    def _export_mesh_maps_standalone(self):
-        """Standalone trigger — exports mesh maps without running the skin batch."""
+    _export_mesh_maps = _export_misc_maps  # Backward-compatible alias
+
+    def _export_misc_maps_standalone(self):
+        """Standalone trigger — exports Misc maps (AO, Curvature, Text & Engraving overlays) without running the skin batch."""
         if self._batch_running:
             QMessageBox.warning(self, "Busy", "A batch export is already running."); return
         if not substance_painter.project.is_open():
@@ -1423,25 +1685,27 @@ class TextureExporterWindow(QWidget):
 
         sp_fmt  = self.FORMATS[self._b_fmt.currentText()]
         sibling = (self._mm_location.currentData() == "sibling")
-        dirs    = [_resolve_meshmap_dir(p, sibling) for p in buckets]
+        dirs    = [_resolve_misc_dir(p, sibling) for p in buckets]
         reply   = QMessageBox.question(
-            self, "Export Curvature + AO",
-            f"Export baked Curvature + AO mesh maps to:\n"
+            self, "Export Misc Maps",
+            f"Export Misc maps (AO, Curvature, Text Overlay, Engraving Overlay) to:\n"
             + "\n".join(f"  {d}" for d in dirs)
             + f"\n\nFormat: {sp_fmt.upper()}\nContinue?",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply != QMessageBox.Yes: return
 
-        self._b_log.append("─── Curvature + AO export ───")
-        errors = self._export_mesh_maps(buckets, sp_fmt)
+        self._b_log.append("─── Misc export (AO, Curvature, Overlays) ───")
+        errors = self._export_misc_maps(buckets, sp_fmt)
         if errors:
-            QMessageBox.warning(self, "Mesh Map Export — Errors",
+            QMessageBox.warning(self, "Misc Export — Errors",
                 f"{len(buckets) - len(errors)}/{len(buckets)} paths succeeded.\n"
                 f"Errors:\n" + "\n".join(errors))
         else:
-            QMessageBox.information(self, "Mesh Map Export",
-                f"Curvature + AO exported to {len(buckets)} location(s).")
+            QMessageBox.information(self, "Misc Export Complete",
+                f"Misc maps exported to {len(buckets)} location(s):\n" + "\n".join(dirs))
+
+    _export_mesh_maps_standalone = _export_misc_maps_standalone  # Backward-compatible alias
 
     # =========================================================================
     # ── Batch: run ────────────────────────────────────────────────────────────
@@ -1498,7 +1762,14 @@ class TextureExporterWindow(QWidget):
                     ctx_st = primary_ctx
                 else:
                     auto = _auto_detect_ctx(st, r)
-                    fill = auto["fill"]; inv = wp = None
+                    fill = None
+                    if primary_ctx.get("fill"):
+                        target_name = primary_ctx["fill"].get_name()
+                        for _, fn in _walk_fills(st):
+                            if fn.get_name() == target_name:
+                                fill = fn; break
+                    if not fill: fill = auto["fill"]
+                    inv = wp = None
                     if fill:
                         try:
                             for fx in fill.content_effects():
@@ -1508,10 +1779,18 @@ class TextureExporterWindow(QWidget):
                             for fx in fill.mask_effects():
                                 if _is_paint_fx(fx): wp = fx; break
                         except Exception: pass
+                    eng = None
+                    if primary_ctx.get("engraving"):
+                        target_eng = primary_ctx["engraving"].get_name()
+                        for _, en in _walk_all(st):
+                            if en.get_name() == target_eng:
+                                eng = en; break
+                    if not eng: eng = auto["engraving"]
                     ctx_st = {"fill": fill, "invert": inv, "worn_paint": wp,
                                "bp_group":   auto["bp_group"],
                                "bp_nonworn": auto["bp_nonworn"],
-                               "bp_worn":    auto["bp_worn"]}
+                               "bp_worn":    auto["bp_worn"],
+                               "engraving":  eng}
                 stack_infos.append({"ts": ts, "root": r, "jobs": j_filt,
                                     "all_skins": skins, "all_cats": cats, "ctx": ctx_st})
             except Exception as e:
@@ -1664,26 +1943,27 @@ class TextureExporterWindow(QWidget):
         if errors: status += f", {len(set(errors))} failed"
         self._b_current.setText(status)
 
-        # ── Auto-run mesh map export if enabled and batch wasn't cancelled ────
+        # ── Auto-run Misc export if enabled and batch wasn't cancelled ────
         mm_errors = []
         if self._mm_enabled.isChecked() and not cancelled:
-            self._b_log.append("─── Curvature + AO export ───")
-            self._b_current.setText("Exporting Curvature + AO mesh maps…")
+            self._b_log.append("─── Misc export (AO, Curvature, Overlays) ───")
+            self._b_current.setText("Exporting Misc maps…")
             QCoreApplication.processEvents()
-            mm_errors = self._export_mesh_maps(buckets, sp_fmt)
+            stack_infos_by_ts = {si["ts"].name: si for si in stack_infos}
+            mm_errors = self._export_misc_maps(buckets, sp_fmt, stack_infos_by_ts)
             self._b_current.setText(status)
 
         if errors:
             QMessageBox.warning(self, "Batch Complete with Errors",
                                 f"{ok}/{n_skins} skins exported.\n"
                                 f"Failed: {', '.join(dict.fromkeys(errors))}"
-                                + (f"\n\nMesh map errors:\n" + "\n".join(mm_errors) if mm_errors else ""))
+                                + (f"\n\nMisc export errors:\n" + "\n".join(mm_errors) if mm_errors else ""))
         elif mm_errors:
-            QMessageBox.warning(self, "Batch Complete — Mesh Map Errors",
+            QMessageBox.warning(self, "Batch Complete — Misc Export Errors",
                                 f"All {ok} skins exported.\n\n"
-                                f"Curvature + AO export failed:\n" + "\n".join(mm_errors))
+                                f"Misc export failed:\n" + "\n".join(mm_errors))
         elif not cancelled:
-            mm_note = "\nCurvature + AO mesh maps also exported." if self._mm_enabled.isChecked() else ""
+            mm_note = "\nMisc maps (AO, Curvature, Overlays) also exported." if self._mm_enabled.isChecked() else ""
             QMessageBox.information(self, "Batch Complete",
                                     f"All {ok} skins exported successfully.{mm_note}")
 
