@@ -20,6 +20,10 @@ v7 changes:
   4. Text & Engraving Folder Support:
      - Both Text and Engraving pickers now support Folders (GroupLayerNode) and Fill layers (FillLayerNode).
      - Effect detection (invert filter, worn paint) automatically inspects folder children when a folder is selected for Text.
+  5. Mask Fill Effect Support for Worn Layer:
+     - Worn paint picker supports both Paint effects (PaintEffectNode) and Fill effects (FillEffectNode) on layer masks.
+     - Automatically discovers mask fill effects (e.g. 'Worn' fill effect on Text folder or layer mask) and auto-selects them when named 'worn'.
+     - Multi-texture set contextual matching properly resolves both mask fill and paint effects across all texture sets.
 
 v6 changes:
   1. Select All / Select None checkboxes for Texture Sets.
@@ -133,6 +137,7 @@ def _channel_map_entry(map_name: str, src_map_name: str, rgb: bool) -> dict:
 def _is_group(n):     return isinstance(n, sp_ls.GroupLayerNode)
 def _is_fill(n):      return isinstance(n, sp_ls.FillLayerNode)
 def _is_paint_fx(n):  return isinstance(n, sp_ls.PaintEffectNode)
+def _is_fill_fx(n):   return isinstance(n, sp_ls.FillEffectNode)
 def _is_filter_fx(n): return isinstance(n, sp_ls.FilterEffectNode)
 
 def _is_proper_layer(n):
@@ -530,7 +535,11 @@ def _auto_detect_ctx(stack, skin_root):
         if skin_root is not None and node is skin_root: continue
         try:
             has_f = any(_is_filter_fx(fx) for fx in node.content_effects())
-            has_p = any(_is_paint_fx(fx)  for fx in node.mask_effects())
+            has_p = any((_is_paint_fx(fx) or _is_fill_fx(fx)) for fx in node.mask_effects())
+            if not has_p and _is_group(node):
+                for ch in node.sub_layers():
+                    if any((_is_paint_fx(fx) or _is_fill_fx(fx)) for fx in ch.mask_effects()):
+                        has_p = True; break
         except Exception: continue
         if has_f and has_p: best = node; break
         if has_f and not fallback: fallback = node
@@ -795,7 +804,7 @@ class TextureExporterWindow(QWidget):
             setattr(self, attr, c); r.addWidget(c); ctg.addLayout(r)
         _crow("Text Layer / Folder:",    "_ctx_fill",     "FillLayerNode or GroupLayerNode containing text markings.")
         _crow("Engraving Layer/Folder:", "_ctx_engraving","FillLayerNode or GroupLayerNode containing engravings/markings.")
-        _crow("Worn Paint Layer:",       "_ctx_worn_paint","PaintEffectNode in fill layer's mask_effects(). Auto-populated.")
+        _crow("Worn Mask Effect / Layer:","_ctx_worn_paint","Paint or Fill effect in mask_effects(). Toggled ON for Worn category and OFF otherwise.")
         _crow("Black Parts Group:",      "_ctx_bp_group", "GroupLayerNode containing non-worn and worn child layers.")
         _crow("Black Parts — Non-Worn:", "_ctx_bp_nonworn","Visible for Normal and Bright exports.")
         _crow("Black Parts — Worn:",     "_ctx_bp_worn",  "Visible for Worn exports.")
@@ -1032,25 +1041,39 @@ class TextureExporterWindow(QWidget):
 
     def _populate_worn_paint_picker(self, auto_first=False):
         self._ctx_worn_paint.blockSignals(True); self._ctx_worn_paint.clear(); self._ctx_worn_paint.addItem("— none —", None)
-        best = 0; fill = self._ctx_fill.currentData()
+        best = 0; best_had_worn = False; fill = self._ctx_fill.currentData()
         if fill is not None:
             try:
                 cnt = 0
                 for fx in fill.mask_effects():
-                    if _is_paint_fx(fx):
-                        self._ctx_worn_paint.addItem(fx.get_name(), fx); cnt += 1
-                        if auto_first and cnt == 1: best = 1
+                    if _is_paint_fx(fx) or _is_fill_fx(fx):
+                        cnt += 1
+                        self._ctx_worn_paint.addItem(fx.get_name(), fx)
+                        is_worn = "worn" in fx.get_name().lower()
+                        if auto_first:
+                            if best == 0 or (is_worn and not best_had_worn):
+                                best = cnt
+                                if is_worn: best_had_worn = True
                 if _is_group(fill):
                     for ch in fill.sub_layers():
                         try:
                             for fx in ch.mask_effects():
-                                if _is_paint_fx(fx):
-                                    self._ctx_worn_paint.addItem(f"{ch.get_name()} → {fx.get_name()}", fx); cnt += 1
-                                    if auto_first and cnt == 1: best = 1
+                                if _is_paint_fx(fx) or _is_fill_fx(fx):
+                                    cnt += 1
+                                    self._ctx_worn_paint.addItem(f"{ch.get_name()} → {fx.get_name()}", fx)
+                                    is_worn = "worn" in fx.get_name().lower()
+                                    if auto_first:
+                                        if best == 0 or (is_worn and not best_had_worn):
+                                            best = cnt
+                                            if is_worn: best_had_worn = True
                         except Exception: pass
                         if "worn" in ch.get_name().lower():
-                            self._ctx_worn_paint.addItem(f"{ch.get_name()} (layer)", ch); cnt += 1
-                            if auto_first and cnt == 1: best = 1
+                            cnt += 1
+                            self._ctx_worn_paint.addItem(f"{ch.get_name()} (layer)", ch)
+                            if auto_first:
+                                if best == 0 or not best_had_worn:
+                                    best = cnt
+                                    best_had_worn = True
             except Exception as e: self._sp_log(f"Worn paint picker: {e}", warn=True)
         self._ctx_worn_paint.blockSignals(False); self._ctx_worn_paint.setCurrentIndex(best)
 
@@ -1082,7 +1105,7 @@ class TextureExporterWindow(QWidget):
             for i in range(combo.count()):
                 if combo.itemData(i) is target: combo.setCurrentIndex(i); break
 
-    def _on_fill_changed(self, _): self._populate_worn_paint_picker()
+    def _on_fill_changed(self, _): self._populate_worn_paint_picker(auto_first=True)
     def _on_bp_changed(self, _):   self._populate_bp_child_pickers()
 
     def _ctx_nodes(self):
@@ -1570,10 +1593,48 @@ class TextureExporterWindow(QWidget):
                                 for fx in f_node.content_effects():
                                     if _is_filter_fx(fx): inv = fx; break
                             except Exception: pass
+                            if not inv and _is_group(f_node):
+                                try:
+                                    for ch in f_node.sub_layers():
+                                        for fx in ch.content_effects():
+                                            if _is_filter_fx(fx): inv = fx; break
+                                        if inv: break
+                                except Exception: pass
+                        if primary_ctx.get("worn_paint"):
+                            target_wp = primary_ctx["worn_paint"].get_name()
+                            if f_node:
+                                try:
+                                    for fx in f_node.mask_effects():
+                                        if fx.get_name() == target_wp: wp = fx; break
+                                except Exception: pass
+                                if not wp and _is_group(f_node):
+                                    try:
+                                        for ch in f_node.sub_layers():
+                                            if ch.get_name() == target_wp: wp = ch; break
+                                            for fx in ch.mask_effects():
+                                                if fx.get_name() == target_wp: wp = fx; break
+                                            if wp: break
+                                    except Exception: pass
+                        if not wp and f_node:
                             try:
                                 for fx in f_node.mask_effects():
-                                    if _is_paint_fx(fx): wp = fx; break
+                                    if _is_paint_fx(fx) or _is_fill_fx(fx):
+                                        if "worn" in fx.get_name().lower() or wp is None:
+                                            wp = fx
+                                            if "worn" in fx.get_name().lower(): break
                             except Exception: pass
+                            if not wp and _is_group(f_node):
+                                try:
+                                    for ch in f_node.sub_layers():
+                                        for fx in ch.mask_effects():
+                                            if _is_paint_fx(fx) or _is_fill_fx(fx):
+                                                if "worn" in fx.get_name().lower() or wp is None:
+                                                    wp = fx
+                                                    if "worn" in fx.get_name().lower(): break
+                                        if wp and "worn" in wp.get_name().lower(): break
+                                        if "worn" in ch.get_name().lower():
+                                            wp = ch; break
+                                except Exception: pass
                         e_node = None
                         if primary_ctx.get("engraving"):
                             tname = primary_ctx["engraving"].get_name()
@@ -1817,10 +1878,48 @@ class TextureExporterWindow(QWidget):
                             for fx in fill.content_effects():
                                 if _is_filter_fx(fx): inv = fx; break
                         except Exception: pass
+                        if not inv and _is_group(fill):
+                            try:
+                                for ch in fill.sub_layers():
+                                    for fx in ch.content_effects():
+                                        if _is_filter_fx(fx): inv = fx; break
+                                    if inv: break
+                            except Exception: pass
+                    if primary_ctx.get("worn_paint"):
+                        target_wp = primary_ctx["worn_paint"].get_name()
+                        if fill:
+                            try:
+                                for fx in fill.mask_effects():
+                                    if fx.get_name() == target_wp: wp = fx; break
+                            except Exception: pass
+                            if not wp and _is_group(fill):
+                                try:
+                                    for ch in fill.sub_layers():
+                                        if ch.get_name() == target_wp: wp = ch; break
+                                        for fx in ch.mask_effects():
+                                            if fx.get_name() == target_wp: wp = fx; break
+                                        if wp: break
+                                except Exception: pass
+                    if not wp and fill:
                         try:
                             for fx in fill.mask_effects():
-                                if _is_paint_fx(fx): wp = fx; break
+                                if _is_paint_fx(fx) or _is_fill_fx(fx):
+                                    if "worn" in fx.get_name().lower() or wp is None:
+                                        wp = fx
+                                        if "worn" in fx.get_name().lower(): break
                         except Exception: pass
+                        if not wp and _is_group(fill):
+                            try:
+                                for ch in fill.sub_layers():
+                                    for fx in ch.mask_effects():
+                                        if _is_paint_fx(fx) or _is_fill_fx(fx):
+                                            if "worn" in fx.get_name().lower() or wp is None:
+                                                wp = fx
+                                                if "worn" in fx.get_name().lower(): break
+                                    if wp and "worn" in wp.get_name().lower(): break
+                                    if "worn" in ch.get_name().lower():
+                                        wp = ch; break
+                            except Exception: pass
                     eng = None
                     if primary_ctx.get("engraving"):
                         target_eng = primary_ctx["engraving"].get_name()
