@@ -17,6 +17,9 @@ v7 changes:
      - Isolated/solo visibility when exporting Text and Engraving overlays, restoring scene state safely.
   3. Filename convention updated:
      - Added texture set name directly to all misc export files (e.g. AO_Barrel, Curvature_Barrel, Overlay_Text_Barrel, Overlay_Engraving_Barrel).
+  4. Text & Engraving Folder Support:
+     - Both Text and Engraving pickers now support Folders (GroupLayerNode) and Fill layers (FillLayerNode).
+     - Effect detection (invert filter, worn paint) automatically inspects folder children when a folder is selected for Text.
 
 v6 changes:
   1. Select All / Select None checkboxes for Texture Sets.
@@ -522,13 +525,20 @@ def _find_best_deep_match(ts_name: str, all_folders: list) -> tuple:
 def _auto_detect_ctx(stack, skin_root):
     result = {"fill": None, "bp_group": None, "bp_nonworn": None, "bp_worn": None, "engraving": None}
     best = fallback = None
-    for _, node in _walk_fills(stack):
+    # Check all fills and groups for text markings (effects or name hint)
+    for _, node in _walk_all(stack):
+        if skin_root is not None and node is skin_root: continue
         try:
             has_f = any(_is_filter_fx(fx) for fx in node.content_effects())
             has_p = any(_is_paint_fx(fx)  for fx in node.mask_effects())
         except Exception: continue
         if has_f and has_p: best = node; break
         if has_f and not fallback: fallback = node
+    if not best:
+        for _, node in _walk_all(stack):
+            if skin_root is not None and node is skin_root: continue
+            if "text" in node.get_name().lower():
+                best = node; break
     result["fill"] = best or fallback
 
     # ── Auto-detect engraving (fill layer or folder containing 'engrav') ─────
@@ -783,7 +793,7 @@ class TextureExporterWindow(QWidget):
             c = QComboBox(); c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             if tip: c.setToolTip(tip)
             setattr(self, attr, c); r.addWidget(c); ctg.addLayout(r)
-        _crow("Text Fill Layer:",        "_ctx_fill",     "FillLayerNode with Invert filter in content_effects().")
+        _crow("Text Layer / Folder:",    "_ctx_fill",     "FillLayerNode or GroupLayerNode containing text markings.")
         _crow("Engraving Layer/Folder:", "_ctx_engraving","FillLayerNode or GroupLayerNode containing engravings/markings.")
         _crow("Worn Paint Layer:",       "_ctx_worn_paint","PaintEffectNode in fill layer's mask_effects(). Auto-populated.")
         _crow("Black Parts Group:",      "_ctx_bp_group", "GroupLayerNode containing non-worn and worn child layers.")
@@ -976,12 +986,26 @@ class TextureExporterWindow(QWidget):
         except Exception as e: self._sp_log(f"Ctx picker refresh: {e}", warn=True)
 
     def _populate_fill_picker(self, stack, auto_select=None):
-        self._ctx_fill.blockSignals(True); self._ctx_fill.clear(); self._ctx_fill.addItem("— none —", None)
+        self._ctx_fill.blockSignals(True)
+        self._ctx_fill.clear()
+        self._ctx_fill.addItem("— none —", None)
         best = 0
-        for i, (d, n) in enumerate(_walk_fills(stack)):
-            self._ctx_fill.addItem("  " * d + n.get_name(), n)
-            if auto_select is n: best = i + 1
-        self._ctx_fill.blockSignals(False); self._ctx_fill.setCurrentIndex(best)
+        idx = 0
+        for d, n in _walk_all(stack):
+            if _is_group(n):
+                idx += 1
+                self._ctx_fill.addItem("  " * d + f"📁 {n.get_name()}", n)
+                if auto_select is n: best = idx
+            elif _is_fill(n):
+                idx += 1
+                self._ctx_fill.addItem("  " * d + f"📄 {n.get_name()}", n)
+                if auto_select is n: best = idx
+            elif _is_proper_layer(n):
+                idx += 1
+                self._ctx_fill.addItem("  " * d + f"🎨 {n.get_name()}", n)
+                if auto_select is n: best = idx
+        self._ctx_fill.blockSignals(False)
+        self._ctx_fill.setCurrentIndex(best)
         self._populate_worn_paint_picker(auto_first=(best > 0))
 
     def _populate_engraving_picker(self, stack, auto_select=None):
@@ -1016,6 +1040,17 @@ class TextureExporterWindow(QWidget):
                     if _is_paint_fx(fx):
                         self._ctx_worn_paint.addItem(fx.get_name(), fx); cnt += 1
                         if auto_first and cnt == 1: best = 1
+                if _is_group(fill):
+                    for ch in fill.sub_layers():
+                        try:
+                            for fx in ch.mask_effects():
+                                if _is_paint_fx(fx):
+                                    self._ctx_worn_paint.addItem(f"{ch.get_name()} → {fx.get_name()}", fx); cnt += 1
+                                    if auto_first and cnt == 1: best = 1
+                        except Exception: pass
+                        if "worn" in ch.get_name().lower():
+                            self._ctx_worn_paint.addItem(f"{ch.get_name()} (layer)", ch); cnt += 1
+                            if auto_first and cnt == 1: best = 1
             except Exception as e: self._sp_log(f"Worn paint picker: {e}", warn=True)
         self._ctx_worn_paint.blockSignals(False); self._ctx_worn_paint.setCurrentIndex(best)
 
@@ -1058,6 +1093,13 @@ class TextureExporterWindow(QWidget):
                 for fx in fill.content_effects():
                     if _is_filter_fx(fx): inv = fx; break
             except Exception: pass
+            if not inv and _is_group(fill):
+                try:
+                    for ch in fill.sub_layers():
+                        for fx in ch.content_effects():
+                            if _is_filter_fx(fx): inv = fx; break
+                        if inv: break
+                except Exception: pass
         return {"fill": fill, "invert": inv,
                 "worn_paint": self._ctx_worn_paint.currentData(),
                 "bp_group":   self._ctx_bp_group.currentData(),
@@ -1519,7 +1561,7 @@ class TextureExporterWindow(QWidget):
                         f_node = None
                         if primary_ctx.get("fill"):
                             tname = primary_ctx["fill"].get_name()
-                            for _, fn in _walk_fills(st):
+                            for _, fn in _walk_all(st):
                                 if fn.get_name() == tname: f_node = fn; break
                         if not f_node: f_node = auto["fill"]
                         inv = wp = None
@@ -1765,7 +1807,7 @@ class TextureExporterWindow(QWidget):
                     fill = None
                     if primary_ctx.get("fill"):
                         target_name = primary_ctx["fill"].get_name()
-                        for _, fn in _walk_fills(st):
+                        for _, fn in _walk_all(st):
                             if fn.get_name() == target_name:
                                 fill = fn; break
                     if not fill: fill = auto["fill"]
