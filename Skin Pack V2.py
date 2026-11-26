@@ -24,6 +24,13 @@ v7 changes:
      - Worn paint picker supports both Paint effects (PaintEffectNode) and Fill effects (FillEffectNode) on layer masks.
      - Automatically discovers mask fill effects (e.g. 'Worn' fill effect on Text folder or layer mask) and auto-selects them when named 'worn'.
      - Multi-texture set contextual matching properly resolves both mask fill and paint effects across all texture sets.
+  6. Overall Progress Window & Reliable Cancellation:
+     - Added an always-on-top floating overall progress dialog (_BatchProgressDialog) positioned near top-center so Substance Painter's per-export modal popup does not cover it.
+     - Overall progress tracks all skins, path buckets, and Misc export steps in one bar.
+     - All export_project_textures() calls now detect ExportStatus.Cancelled (when Cancel is clicked on SP's export dialog), immediately aborting the entire batch/Misc run, restoring layer visibility, and displaying a cancellation confirmation dialog.
+  7. Transparent Overlay Background:
+     - build_overlay_export_config() now exports RGBA (R, G, B, A from baseColor) with 'passthrough' padding (and automatically uses PNG if JPEG is selected) so overlay backgrounds are fully transparent.
+     - Overlay export truly solos the Text/Engraving layer by hiding all other root layers and ancestor siblings before exporting, then restoring all visibility safely.
 
 v6 changes:
   1. Select All / Select None checkboxes for Texture Sets.
@@ -82,7 +89,7 @@ import substance_painter.logging
 
 from PySide6.QtGui     import QAction
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QLineEdit,
     QFileDialog, QGroupBox, QMessageBox, QSizePolicy,
     QProgressBar, QTextEdit, QScrollArea,
@@ -281,6 +288,56 @@ def _restore_vis(st):
         except Exception: pass
 
 
+def _collect_solo_nodes(stack, target):
+    """Return all nodes whose visibility will be touched when soloing `target`."""
+    nodes = set()
+    try:
+        for rn in sp_ls.get_root_layer_nodes(stack):
+            nodes.add(rn)
+    except Exception:
+        pass
+    p = target
+    while p is not None:
+        nodes.add(p)
+        parent = p.get_parent()
+        if parent is not None and _is_group(parent):
+            try:
+                for sib in parent.sub_layers():
+                    nodes.add(sib)
+            except Exception:
+                pass
+        p = parent
+    return nodes
+
+
+def _solo_node(stack, target):
+    """Hide all other layers in `stack` so ONLY `target` (and its ancestor chain) is visible."""
+    try:
+        for rn in sp_ls.get_root_layer_nodes(stack):
+            try: rn.set_visible(False)
+            except Exception: pass
+    except Exception:
+        pass
+    if target is None:
+        return
+    chain = []
+    p = target
+    while p is not None:
+        chain.append(p)
+        p = p.get_parent()
+    for anc in chain[1:]:
+        if _is_group(anc):
+            try:
+                for sib in anc.sub_layers():
+                    try: sib.set_visible(False)
+                    except Exception: pass
+            except Exception:
+                pass
+    for node in reversed(chain):
+        try: node.set_visible(True)
+        except Exception: pass
+
+
 # =============================================================================
 # ── TextureSet helpers ────────────────────────────────────────────────────────
 # =============================================================================
@@ -390,14 +447,17 @@ def build_overlay_export_config(
     map_fileName: str,
 ) -> dict:
     """
-    Export an isolated overlay (Text or Engraving) as a Base Color document map.
-    map_fileName uses the $textureSet wildcard, e.g. "Overlay_Text_$textureSet"
-    or "Overlay_Engraving_$textureSet".
+    Export an isolated overlay (Text or Engraving) as an RGBA Base Color
+    document map with a fully transparent background.
+    Uses baseColor's alpha channel (A) and 'passthrough' padding so areas
+    outside the soloed layer/mask are 100% transparent.
+    Falls back to PNG if sp_format is JPEG (which does not support alpha).
     """
+    overlay_fmt = "png" if sp_format == "jpeg" else sp_format
     channels = [
         {"destChannel": c, "srcChannel": c,
          "srcMapType": "documentMap", "srcMapName": "baseColor"}
-        for c in ("R", "G", "B")
+        for c in ("R", "G", "B", "A")
     ]
     maps = [{"fileName": map_fileName, "channels": channels}]
     return {
@@ -407,11 +467,10 @@ def build_overlay_export_config(
         "defaultExportPreset": "MiscOverlay",
         "exportList":         [{"rootPath": rp} for rp in ts_root_paths],
         "exportParameters":   [{"parameters": {
-            "fileFormat":       sp_format,
+            "fileFormat":       overlay_fmt,
             "bitDepth":         "8",
             "dithering":        False,
-            "paddingAlgorithm": "infinite",
-            "dilationDistance": 16,
+            "paddingAlgorithm": "passthrough",
         }}],
     }
 
@@ -594,6 +653,91 @@ def _auto_detect_ctx(stack, skin_root):
 
 
 # =============================================================================
+# ── Floating Overall Progress Dialog ─────────────────────────────────────────
+# =============================================================================
+class _BatchProgressDialog(QDialog):
+    """
+    Compact always-on-top overall progress window shown during batch/Misc exports.
+    Positioned near top-center so Substance Painter's centered per-export modal
+    dialog does not cover it.
+    """
+    def __init__(self, title: str, total: int, on_cancel, parent=None):
+        super().__init__(parent)
+        self._on_cancel = on_cancel
+        self._finished  = False
+        self.setWindowTitle(title)
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setMinimumWidth(430)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+
+        self._status = QLabel("Starting…")
+        self._status.setStyleSheet("font-weight:bold;font-size:12px;")
+        lay.addWidget(self._status)
+
+        self._bar = QProgressBar()
+        self._bar.setMinimum(0)
+        self._bar.setMaximum(max(1, total))
+        self._bar.setValue(0)
+        self._bar.setFormat("%v / %m  (%p%)")
+        lay.addWidget(self._bar)
+
+        hint = QLabel("Tip: Clicking Cancel below OR on Substance Painter's export popup aborts the entire batch.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#aaa;font-size:11px;")
+        lay.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self._cancel_btn = QPushButton("⏹ Cancel Batch")
+        self._cancel_btn.setFixedHeight(28)
+        self._cancel_btn.setStyleSheet(
+            "QPushButton          {background:#8b2020;color:white;font-weight:bold;padding:0 14px;}"
+            "QPushButton:hover    {background:#b03030;}"
+            "QPushButton:disabled {background:#444;color:#888;}"
+        )
+        self._cancel_btn.clicked.connect(self._handle_cancel)
+        btn_row.addWidget(self._cancel_btn)
+        lay.addLayout(btn_row)
+
+        try:
+            scr = QApplication.primaryScreen()
+            if scr:
+                geo = scr.availableGeometry()
+                self.adjustSize()
+                self.move(geo.x() + (geo.width() - self.width()) // 2, geo.y() + 60)
+        except Exception:
+            pass
+
+    def update_progress(self, done: int, total: int, label: str):
+        self._bar.setMaximum(max(1, total))
+        self._bar.setValue(done)
+        self._status.setText(f"{label}  ({done}/{total})")
+        QCoreApplication.processEvents()
+
+    def set_cancelling(self):
+        self._cancel_btn.setEnabled(False)
+        self._status.setText("Cancelling — stopping batch…")
+        QCoreApplication.processEvents()
+
+    def _handle_cancel(self):
+        self.set_cancelling()
+        if self._on_cancel:
+            self._on_cancel()
+
+    def mark_finished(self):
+        self._finished = True
+        self.close()
+
+    def closeEvent(self, event):
+        if not self._finished:
+            self._handle_cancel()
+        event.accept()
+
+
+# =============================================================================
 # ── Window ────────────────────────────────────────────────────────────────────
 # =============================================================================
 class TextureExporterWindow(QWidget):
@@ -609,6 +753,7 @@ class TextureExporterWindow(QWidget):
         self._last_dir         = ""
         self._batch_running    = False
         self._cancel_requested = False
+        self._prog_dlg         = None
         # {ts_name: {"check": QCheckBox, "path": QLineEdit, "browse": QPushButton}}
         self._ts_widgets       = {}
         self._channel_checks   = {}   # {srcMapName: QCheckBox}
@@ -1411,7 +1556,10 @@ class TextureExporterWindow(QWidget):
     def _tick(self, done, total, name):
         self._b_progress.setValue(done)
         self._b_current.setText(f"Exporting: {name}  ({done}/{total})")
-        QCoreApplication.processEvents()
+        if self._prog_dlg is not None:
+            self._prog_dlg.update_progress(done, total, f"Exporting: {name}")
+        else:
+            QCoreApplication.processEvents()
 
     def _enabled_channels(self):
         return [k for k, cb in self._channel_checks.items() if cb.isChecked()]
@@ -1503,6 +1651,8 @@ class TextureExporterWindow(QWidget):
         self._b_cancel_btn.setEnabled(False)
         self._b_cancel_btn_top.setEnabled(False)
         self._b_current.setText("Cancelling after current export…")
+        if self._prog_dlg is not None:
+            self._prog_dlg.set_cancelling()
         # Force immediate UI update so the user sees feedback now
         QCoreApplication.processEvents()
 
@@ -1510,23 +1660,25 @@ class TextureExporterWindow(QWidget):
     # =========================================================================
     # ── Misc (AO, Curvature, Text & Engraving Overlays) export ───────────────
     # =========================================================================
-    def _export_misc_maps(self, buckets: dict, sp_fmt: str, stack_infos_by_ts: dict = None) -> list:
+    def _export_misc_maps(self, buckets: dict, sp_fmt: str, stack_infos_by_ts: dict = None, tick_cb=None) -> list:
         """
         Export Misc files for every path bucket:
           1. Curvature + AO baked mesh maps (2 files)
              → Curvature_<TextureSet> and AO_<TextureSet>
-          2. Text Overlay baseColor document map (1 file)
+          2. Text Overlay RGBA baseColor document map with transparent background (1 file)
              → Overlay_Text_<TextureSet>
-          3. Engraving Overlay baseColor document map (1 file)
+          3. Engraving Overlay RGBA baseColor document map with transparent background (1 file)
              → Overlay_Engraving_<TextureSet>
           Total: 4 files per Texture Set.
 
         buckets : dict {out_path: [TextureSet, …]}
         sp_fmt  : SP format string e.g. "png"
         stack_infos_by_ts : optional dict {ts.name: stack_info}
+        tick_cb : optional callable(label: str) invoked before each export step
         """
         sibling = (self._mm_location.currentData() == "sibling")
         errors = []
+        ES = substance_painter.export.ExportStatus
 
         primary_ctx = self._ctx_nodes()
         primary_stack = self._get_primary_stack()
@@ -1542,6 +1694,7 @@ class TextureExporterWindow(QWidget):
                 self._blog(f"❌  [misc]  {msg}"); errors.append(msg); continue
 
             # ── 1. Export Mesh Maps (AO & Curvature) ──────────────────────────
+            if tick_cb: tick_cb("Misc: AO & Curvature")
             ts_root_paths = [_ts_root_path(ts) for ts in ts_group]
             config_mesh = build_meshmap_export_config(
                 ts_root_paths = ts_root_paths,
@@ -1552,11 +1705,14 @@ class TextureExporterWindow(QWidget):
             try:
                 r = substance_painter.export.export_project_textures(config_mesh)
                 QCoreApplication.processEvents()
-                ES = substance_painter.export.ExportStatus
                 if r.status in (ES.Success, ES.Warning):
                     n = sum(len(v) for v in r.textures.values())
                     suffix = f" ⚠ {r.message}" if r.status == ES.Warning else ""
                     self._blog(f"✅  [misc]  AO + Curvature → {misc_dir}  ({n} files){suffix}")
+                elif r.status == ES.Cancelled:
+                    self._cancel_requested = True
+                    self._blog("⚠  [misc]  Cancelled by user.")
+                    break
                 else:
                     msg = f"{out_path} (mesh maps): {r.message}"
                     self._blog(f"❌  [misc]  {msg}"); errors.append(msg)
@@ -1645,14 +1801,12 @@ class TextureExporterWindow(QWidget):
                                "bp_group": auto["bp_group"], "bp_nonworn": auto["bp_nonworn"],
                                "bp_worn": auto["bp_worn"], "engraving": e_node}
 
-                    for k in ("fill", "invert", "worn_paint", "bp_group", "engraving"):
-                        node = ctx.get(k)
-                        if node is not None:
-                            touched_nodes.add(node)
-                            p = node.get_parent()
-                            while p is not None:
-                                touched_nodes.add(p)
-                                p = p.get_parent()
+                    # Snapshot every node touched when soloing Text or Engraving
+                    touched_nodes |= _collect_solo_nodes(st, ctx.get("fill"))
+                    touched_nodes |= _collect_solo_nodes(st, ctx.get("engraving"))
+                    for k in ("invert", "worn_paint"):
+                        if ctx.get(k) is not None:
+                            touched_nodes.add(ctx[k])
 
                     ts_data.append({"ts": ts, "stack": st, "root": r, "ctx": ctx})
                 except Exception as e:
@@ -1660,30 +1814,15 @@ class TextureExporterWindow(QWidget):
 
             vis_state = _save_vis(touched_nodes)
             try:
-                # ── 2. Export Text Overlay ────────────────────────────────────
+                # ── 2. Export Text Overlay (fully transparent background) ─────
                 ts_with_text = [d for d in ts_data if d["ctx"].get("fill") is not None]
                 if ts_with_text and not self._cancel_requested:
+                    if tick_cb: tick_cb("Misc: Overlay Text")
                     for d in ts_data:
                         ctx = d["ctx"]
-                        r   = d["root"]
-                        if r is not None:
-                            try: r.set_visible(False)
-                            except Exception: pass
-                        if ctx.get("bp_group") is not None:
-                            try: ctx["bp_group"].set_visible(False)
-                            except Exception: pass
-                        if ctx.get("engraving") is not None:
-                            try: ctx["engraving"].set_visible(False)
-                            except Exception: pass
-                        f = ctx.get("fill")
+                        f   = ctx.get("fill")
+                        _solo_node(d["stack"], f)
                         if f is not None:
-                            try: f.set_visible(True)
-                            except Exception: pass
-                            p = f.get_parent()
-                            while p is not None:
-                                try: p.set_visible(True)
-                                except Exception: pass
-                                p = p.get_parent()
                             if ctx.get("invert") is not None:
                                 try: ctx["invert"].set_visible(True)
                                 except Exception: pass
@@ -1700,11 +1839,14 @@ class TextureExporterWindow(QWidget):
                     try:
                         r = substance_painter.export.export_project_textures(config_text)
                         QCoreApplication.processEvents()
-                        ES = substance_painter.export.ExportStatus
                         if r.status in (ES.Success, ES.Warning):
                             n = sum(len(v) for v in r.textures.values())
                             suffix = f" ⚠ {r.message}" if r.status == ES.Warning else ""
                             self._blog(f"✅  [misc]  Overlay Text → {misc_dir}  ({n} files){suffix}")
+                        elif r.status == ES.Cancelled:
+                            self._cancel_requested = True
+                            self._blog("⚠  [misc]  Cancelled by user.")
+                            break
                         else:
                             msg = f"{out_path} (Text overlay): {r.message}"
                             self._blog(f"❌  [misc]  {msg}"); errors.append(msg)
@@ -1715,30 +1857,14 @@ class TextureExporterWindow(QWidget):
 
                 if self._cancel_requested: break
 
-                # ── 3. Export Engraving Overlay ───────────────────────────────
+                # ── 3. Export Engraving Overlay (fully transparent background) ─
                 ts_with_eng = [d for d in ts_data if d["ctx"].get("engraving") is not None]
                 if ts_with_eng and not self._cancel_requested:
+                    if tick_cb: tick_cb("Misc: Overlay Engraving")
                     for d in ts_data:
                         ctx = d["ctx"]
-                        r   = d["root"]
-                        if r is not None:
-                            try: r.set_visible(False)
-                            except Exception: pass
-                        if ctx.get("bp_group") is not None:
-                            try: ctx["bp_group"].set_visible(False)
-                            except Exception: pass
-                        if ctx.get("fill") is not None:
-                            try: ctx["fill"].set_visible(False)
-                            except Exception: pass
                         eng = ctx.get("engraving")
-                        if eng is not None:
-                            try: eng.set_visible(True)
-                            except Exception: pass
-                            p = eng.get_parent()
-                            while p is not None:
-                                try: p.set_visible(True)
-                                except Exception: pass
-                                p = p.get_parent()
+                        _solo_node(d["stack"], eng)
 
                     config_eng = build_overlay_export_config(
                         ts_root_paths = [_ts_root_path(d["ts"]) for d in ts_with_eng],
@@ -1749,11 +1875,14 @@ class TextureExporterWindow(QWidget):
                     try:
                         r = substance_painter.export.export_project_textures(config_eng)
                         QCoreApplication.processEvents()
-                        ES = substance_painter.export.ExportStatus
                         if r.status in (ES.Success, ES.Warning):
                             n = sum(len(v) for v in r.textures.values())
                             suffix = f" ⚠ {r.message}" if r.status == ES.Warning else ""
                             self._blog(f"✅  [misc]  Overlay Engraving → {misc_dir}  ({n} files){suffix}")
+                        elif r.status == ES.Cancelled:
+                            self._cancel_requested = True
+                            self._blog("⚠  [misc]  Cancelled by user.")
+                            break
                         else:
                             msg = f"{out_path} (Engraving overlay): {r.message}"
                             self._blog(f"❌  [misc]  {msg}"); errors.append(msg)
@@ -1799,8 +1928,40 @@ class TextureExporterWindow(QWidget):
         if reply != QMessageBox.Yes: return
 
         self._b_log.append("─── Misc export (AO, Curvature, Overlays) ───")
-        errors = self._export_misc_maps(buckets, sp_fmt)
-        if errors:
+        total_steps = len(buckets) * 3
+        step_idx    = [0]
+        self._batch_running    = True
+        self._cancel_requested = False
+        self._b_run_btn.setEnabled(False)
+        self._b_cancel_btn.setEnabled(True)
+        self._b_cancel_btn_top.setEnabled(True)
+        self._b_progress.setMaximum(total_steps)
+        self._b_progress.setValue(0)
+        self._prog_dlg = _BatchProgressDialog("Misc Export Progress", total_steps, self._request_cancel, self)
+        self._prog_dlg.show()
+        QCoreApplication.processEvents()
+
+        def _misc_tick(lbl):
+            step_idx[0] += 1
+            self._tick(step_idx[0], total_steps, lbl)
+
+        try:
+            errors = self._export_misc_maps(buckets, sp_fmt, tick_cb=_misc_tick)
+            if not self._cancel_requested:
+                self._tick(total_steps, total_steps, "Done")
+        finally:
+            self._batch_running = False
+            self._b_run_btn.setEnabled(True)
+            self._b_cancel_btn.setEnabled(False)
+            self._b_cancel_btn_top.setEnabled(False)
+            if self._prog_dlg is not None:
+                self._prog_dlg.mark_finished()
+                self._prog_dlg = None
+
+        if self._cancel_requested:
+            self._b_current.setText("Misc export cancelled.")
+            QMessageBox.information(self, "Misc Export Cancelled", "Misc export was cancelled by user.")
+        elif errors:
             QMessageBox.warning(self, "Misc Export — Errors",
                 f"{len(buckets) - len(errors)}/{len(buckets)} paths succeeded.\n"
                 f"Errors:\n" + "\n".join(errors))
@@ -1973,9 +2134,11 @@ class TextureExporterWindow(QWidget):
         if reply != QMessageBox.Yes: return
 
         # ── Setup ─────────────────────────────────────────────────────────────
-        # Progress tracks individual export calls: one per (skin × path-bucket).
-        # This matches what the user sees in the log and "160 files total" style counts.
-        total_ticks = len(jobs) * len(buckets)
+        # Progress tracks individual export calls: one per (skin × path-bucket),
+        # plus 3 steps per bucket if Misc export is enabled.
+        run_misc    = self._mm_enabled.isChecked()
+        misc_ticks  = (len(buckets) * 3) if run_misc else 0
+        total_ticks = len(jobs) * len(buckets) + misc_ticks
         self._batch_running    = True
         self._cancel_requested = False
         self._b_run_btn.setEnabled(False)
@@ -1984,6 +2147,9 @@ class TextureExporterWindow(QWidget):
         self._b_progress.setMaximum(total_ticks)
         self._b_progress.setValue(0)
         self._b_log.clear()
+        self._prog_dlg = _BatchProgressDialog("Batch Export Progress", total_ticks, self._request_cancel, self)
+        self._prog_dlg.show()
+        QCoreApplication.processEvents()
 
         # Snapshot visibility for every node we'll touch across ALL stacks
         all_vis_nodes = []
@@ -1993,120 +2159,148 @@ class TextureExporterWindow(QWidget):
             all_vis_nodes += [n for n in [c["fill"], c["invert"], c["worn_paint"],
                                            c["bp_group"], c["bp_nonworn"], c["bp_worn"]]
                               if n is not None]
-        vis_state = _save_vis(all_vis_nodes)
-        errors    = []
-        tick_idx  = 0
+        vis_state    = _save_vis(all_vis_nodes)
+        errors       = []
+        mm_errors    = []
+        exported_ok  = 0
+        tick_idx     = 0
+        ES           = substance_painter.export.ExportStatus
 
         try:
-            # Initialise every stack: root+cats visible, all skins hidden
-            for si in stack_infos:
-                si["root"].set_visible(True)
-                for n in si["all_cats"]: n.set_visible(True)
-                c = si["ctx"]
-                if c["fill"]:     c["fill"].set_visible(True)
-                if c["bp_group"]: c["bp_group"].set_visible(True)
-                for n in si["all_skins"]: n.set_visible(False)
-
-            for idx, job in enumerate(jobs):
-                if self._cancel_requested:
-                    self._blog("⚠ Cancelled by user."); break
-
-                name = job["filename"]
-                if job["cat_type"] == "worn" and worn_sfx and "worn" not in name.lower():
-                    name = name + worn_sfx
-
-                # Apply ctx toggles and show the correct skin in EVERY stack.
-                # si["jobs"][idx] gives the matching skin node(s) for that stack.
+            try:
+                # Initialise every stack: root+cats visible, all skins hidden
                 for si in stack_infos:
-                    self._apply_ctx(job["cat_type"], si["ctx"])
-                    si_job = si["jobs"][idx] if idx < len(si["jobs"]) else None
-                    if si_job:
-                        for n in si_job["show"]: n.set_visible(True)
+                    si["root"].set_visible(True)
+                    for n in si["all_cats"]: n.set_visible(True)
+                    c = si["ctx"]
+                    if c["fill"]:     c["fill"].set_visible(True)
+                    if c["bp_group"]: c["bp_group"].set_visible(True)
+                    for n in si["all_skins"]: n.set_visible(False)
 
-                # One export call per path bucket (visibility already correct in all stacks)
-                for out_path, ts_group in buckets.items():
-                    if self._cancel_requested: break
+                for idx, job in enumerate(jobs):
+                    if self._cancel_requested:
+                        self._blog("⚠ Cancelled by user."); break
 
-                    tick_idx += 1
-                    self._tick(tick_idx, total_ticks, name)
+                    name = job["filename"]
+                    if job["cat_type"] == "worn" and worn_sfx and "worn" not in name.lower():
+                        name = name + worn_sfx
 
-                    ts_root_paths = [_ts_root_path(ts) for ts in ts_group]
-                    multi_ts      = len(ts_group) > 1
-                    config = build_export_config(
-                        ts_root_paths    = ts_root_paths,
-                        out_dir          = out_path,
-                        skin_name        = name,
-                        sp_format        = sp_fmt,
-                        enabled_channels = channels,
-                        multi_ts         = multi_ts,
-                    )
-                    try:
-                        r = substance_painter.export.export_project_textures(config)
-                        # Process events immediately after each export call so the
-                        # cancel button click registers without waiting for the next tick
-                        QCoreApplication.processEvents()
-                        ES = substance_painter.export.ExportStatus
-                        if r.status in (ES.Success, ES.Warning):
-                            # Warning = completed with warnings but files were written.
-                            # Per 12.1.0 docs: status can never be Error from this call;
-                            # errors raise exceptions instead. Treat Warning as success.
-                            n_files = sum(len(v) for v in r.textures.values())
-                            suffix  = f" ⚠ {r.message}" if r.status == ES.Warning else ""
-                            self._blog(f"✅  [{job['cat_type']:6}]  {name}  → {out_path}  ({n_files} files){suffix}")
-                        else:
-                            self._blog(f"❌  [{job['cat_type']:6}]  {name}  → {out_path}: {r.message}")
+                    # Apply ctx toggles and show the correct skin in EVERY stack.
+                    # si["jobs"][idx] gives the matching skin node(s) for that stack.
+                    for si in stack_infos:
+                        self._apply_ctx(job["cat_type"], si["ctx"])
+                        si_job = si["jobs"][idx] if idx < len(si["jobs"]) else None
+                        if si_job:
+                            for n in si_job["show"]: n.set_visible(True)
+
+                    skin_failed = False
+                    # One export call per path bucket (visibility already correct in all stacks)
+                    for out_path, ts_group in buckets.items():
+                        if self._cancel_requested: break
+
+                        tick_idx += 1
+                        self._tick(tick_idx, total_ticks, f"[{job['cat_type'].capitalize()}] {name}")
+
+                        ts_root_paths = [_ts_root_path(ts) for ts in ts_group]
+                        multi_ts      = len(ts_group) > 1
+                        config = build_export_config(
+                            ts_root_paths    = ts_root_paths,
+                            out_dir          = out_path,
+                            skin_name        = name,
+                            sp_format        = sp_fmt,
+                            enabled_channels = channels,
+                            multi_ts         = multi_ts,
+                        )
+                        try:
+                            r = substance_painter.export.export_project_textures(config)
+                            # Process events immediately after each export call so the
+                            # cancel button click registers without waiting for the next tick
+                            QCoreApplication.processEvents()
+                            if r.status in (ES.Success, ES.Warning):
+                                # Warning = completed with warnings but files were written.
+                                # Per 12.1.0 docs: status can never be Error from this call;
+                                # errors raise exceptions instead. Treat Warning as success.
+                                n_files = sum(len(v) for v in r.textures.values())
+                                suffix  = f" ⚠ {r.message}" if r.status == ES.Warning else ""
+                                self._blog(f"✅  [{job['cat_type']:6}]  {name}  → {out_path}  ({n_files} files){suffix}")
+                            elif r.status == ES.Cancelled:
+                                # User clicked Cancel on Substance Painter's export popup —
+                                # abort the ENTIRE batch immediately instead of continuing.
+                                self._cancel_requested = True
+                                self._blog(f"⚠  [{job['cat_type']:6}]  {name}  — Cancelled by user.")
+                                break
+                            else:
+                                self._blog(f"❌  [{job['cat_type']:6}]  {name}  → {out_path}: {r.message}")
+                                errors.append(name)
+                                skin_failed = True
+                        except Exception as e:
+                            QCoreApplication.processEvents()
+                            self._blog(f"❌  [{job['cat_type']:6}]  {name}  → {out_path}: {e}")
                             errors.append(name)
-                    except Exception as e:
-                        QCoreApplication.processEvents()
-                        self._blog(f"❌  [{job['cat_type']:6}]  {name}  → {out_path}: {e}")
-                        errors.append(name)
+                            skin_failed = True
 
-                # Hide the skin in every stack before moving on
-                for si in stack_infos:
-                    si_job = si["jobs"][idx] if idx < len(si["jobs"]) else None
-                    if si_job:
-                        for n in si_job["show"]: n.set_visible(False)
+                    # Hide the skin in every stack before moving on
+                    for si in stack_infos:
+                        si_job = si["jobs"][idx] if idx < len(si["jobs"]) else None
+                        if si_job:
+                            for n in si_job["show"]: n.set_visible(False)
 
-            if not self._cancel_requested: self._tick(total_ticks, total_ticks, "Done")
+                    if not self._cancel_requested and not skin_failed:
+                        exported_ok += 1
+
+                    if self._cancel_requested:
+                        break
+            finally:
+                _restore_vis(vis_state)
+
+            # ── Auto-run Misc export if enabled and batch wasn't cancelled ────
+            if run_misc and not self._cancel_requested:
+                self._b_log.append("─── Misc export (AO, Curvature, Overlays) ───")
+                stack_infos_by_ts = {si["ts"].name: si for si in stack_infos}
+
+                def _batch_misc_tick(lbl):
+                    nonlocal tick_idx
+                    tick_idx += 1
+                    self._tick(tick_idx, total_ticks, lbl)
+
+                mm_errors = self._export_misc_maps(buckets, sp_fmt, stack_infos_by_ts, tick_cb=_batch_misc_tick)
+
+            if not self._cancel_requested:
+                self._tick(total_ticks, total_ticks, "Done")
 
         finally:
-            _restore_vis(vis_state)
             self._batch_running = False
             self._b_run_btn.setEnabled(True)
             self._b_cancel_btn.setEnabled(False)
             self._b_cancel_btn_top.setEnabled(False)
+            if self._prog_dlg is not None:
+                self._prog_dlg.mark_finished()
+                self._prog_dlg = None
             self._save_config()
 
         n_skins   = len(jobs)
-        ok        = n_skins - len(set(errors))   # unique skin names that had any failure
         cancelled = self._cancel_requested
-        status    = f"{'Cancelled — ' if cancelled else ''}Complete — {ok}/{n_skins} skins exported"
+        status    = f"{'Cancelled — ' if cancelled else 'Complete — '}{exported_ok}/{n_skins} skins exported"
         if errors: status += f", {len(set(errors))} failed"
         self._b_current.setText(status)
 
-        # ── Auto-run Misc export if enabled and batch wasn't cancelled ────
-        mm_errors = []
-        if self._mm_enabled.isChecked() and not cancelled:
-            self._b_log.append("─── Misc export (AO, Curvature, Overlays) ───")
-            self._b_current.setText("Exporting Misc maps…")
-            QCoreApplication.processEvents()
-            stack_infos_by_ts = {si["ts"].name: si for si in stack_infos}
-            mm_errors = self._export_misc_maps(buckets, sp_fmt, stack_infos_by_ts)
-            self._b_current.setText(status)
-
-        if errors:
+        if cancelled:
+            QMessageBox.information(self, "Batch Export Cancelled",
+                                    f"Batch export was cancelled by user.\n"
+                                    f"{exported_ok}/{n_skins} skins exported before stopping.")
+        elif errors:
             QMessageBox.warning(self, "Batch Complete with Errors",
-                                f"{ok}/{n_skins} skins exported.\n"
+                                f"{exported_ok}/{n_skins} skins exported.\n"
                                 f"Failed: {', '.join(dict.fromkeys(errors))}"
                                 + (f"\n\nMisc export errors:\n" + "\n".join(mm_errors) if mm_errors else ""))
         elif mm_errors:
             QMessageBox.warning(self, "Batch Complete — Misc Export Errors",
-                                f"All {ok} skins exported.\n\n"
+                                f"All {exported_ok} skins exported.\n\n"
                                 f"Misc export failed:\n" + "\n".join(mm_errors))
-        elif not cancelled:
-            mm_note = "\nMisc maps (AO, Curvature, Overlays) also exported." if self._mm_enabled.isChecked() else ""
+        else:
+            mm_note = "\nMisc maps (AO, Curvature, Overlays) also exported." if run_misc else ""
             QMessageBox.information(self, "Batch Complete",
-                                    f"All {ok} skins exported successfully.{mm_note}")
+                                    f"All {exported_ok} skins exported successfully.{mm_note}")
 
     # ── Window close → hide ───────────────────────────────────────────────────
     def closeEvent(self, event):
